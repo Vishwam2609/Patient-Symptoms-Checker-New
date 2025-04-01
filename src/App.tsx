@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Button } from './components/ui/button';
 import { Mic, Loader2, CheckCircle, User } from 'lucide-react';
 
-const API_BASE_URL = 'https://ae83-2405-201-2032-c081-6107-4aad-81ec-9057.ngrok-free.app';
+const API_BASE_URL = 'https://3e7e-2405-201-2032-c081-6107-4aad-81ec-9057.ngrok-free.app';
 
 // Static follow-up questions mapping.
 const staticFollowUpQuestionsMapping: { [key: string]: string[] } = {
