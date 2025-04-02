@@ -347,11 +347,9 @@ def generate_guidelines():
 
     transcript = data.get("transcript", "").strip()
     key_symptom = data.get("key_symptom", "").strip()
-    # Use empty lists if follow_up or dynamic_followup are not provided.
     static_followup = data.get("follow_up", [])
     dynamic_followup = data.get("dynamic_followup", [])
 
-    # (Optional: Validate that transcript and key_symptom are not empty.)
     if not transcript or not key_symptom:
         return jsonify({"error": "Transcript and key_symptom cannot be empty."}), 400
 
@@ -362,26 +360,25 @@ def generate_guidelines():
         if not item.get("answer", "").strip():
             return jsonify({"error": "All dynamic follow-up questions must be answered."}), 400
 
-    try:
-        llm_handler.load_model()
-        guidelines_text = llm_handler.generate_guidelines(transcript, key_symptom, static_followup, dynamic_followup)
-    except Exception as e:
-        logger.error("Guideline generation error", exc_info=True)
-        return jsonify({"error": f"Guideline generation error: {str(e)}"}), 500
-
+    # Load the model if needed.
+    llm_handler.load_model()
+    # Generate the full guidelines synchronously.
+    guidelines_text = llm_handler.generate_guidelines(transcript, key_symptom, static_followup, dynamic_followup)
     logger.info(f"Generated guidelines: '{guidelines_text}'")
+
+    # Convert the guidelines to audio.
     try:
         tts = gTTS(text=guidelines_text, lang='en')
         audio_io = io.BytesIO()
         tts.write_to_fp(audio_io)
         audio_io.seek(0)
         audio_base64 = base64.b64encode(audio_io.read()).decode('utf-8')
-        audio_data_url = f"data:audio/mp3;base64,{audio_base64}"
+        audio_data = f"data:audio/mp3;base64,{audio_base64}"
     except Exception as e:
         logger.error("TTS conversion error", exc_info=True)
-        audio_data_url = ""
+        audio_data = ""
 
-    return jsonify({"guidelines": guidelines_text, "audio": audio_data_url})
+    return jsonify({"guidelines": guidelines_text, "audio_data": audio_data})
 
 if __name__ == "__main__":
     try:
