@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Button } from './components/ui/button';
 import { Mic, Loader2, User } from 'lucide-react';
-import './styles.css'; // Import the updated CSS file
+import './styles.css';
 
-// Adjust the API_BASE_URL to your server
-const API_BASE_URL = 'https://a50c-34-169-41-141.ngrok-free.app/';
+// Adjust the API_BASE_URL to match your server endpoint
+const API_BASE_URL = 'https://5f54-35-198-212-87.ngrok-free.app/';
 
+// Define application steps
 type AppStep =
   | 'initial'
   | 'recording'
@@ -16,13 +17,24 @@ type AppStep =
   | 'dynamicFollowup'
   | 'final';
 
+// Define message structure for conversation
 interface Message {
   sender: 'doctor' | 'patient';
   text: string;
   timestamp: Date;
 }
 
-/** Speech Utility: Cancel any existing speech before speaking */
+// Define symptom summary structure
+interface SymptomSummary {
+  key_symptom: string;
+  severity: string;
+  onset_duration: string;
+  location: string;
+  character: string;
+  associated_symptoms: string;
+}
+
+/** Utility to speak text, canceling any ongoing speech */
 function speak(text: string) {
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
@@ -31,7 +43,7 @@ function speak(text: string) {
   window.speechSynthesis.speak(utterance);
 }
 
-/** Initiates the browser's speech recognition with silence detection */
+/** Starts browser-based speech recognition with silence detection */
 const startSpeechRecognition = (
   onResult: (transcript: string) => void,
   onError: (err: any) => void,
@@ -51,7 +63,7 @@ const startSpeechRecognition = (
 
   let finalTranscript = '';
   let silenceTimeout: NodeJS.Timeout | null = null;
-  const SILENCE_THRESHOLD = 1000; // 1 seconds of silence
+  const SILENCE_THRESHOLD = 1000; // 1 second of silence
 
   recognition.onstart = () => toggleMic && toggleMic(true);
 
@@ -90,7 +102,7 @@ const startSpeechRecognition = (
   return recognition;
 };
 
-/** Speaks a message, then listens for a response */
+/** Speaks a message and listens for a response */
 const speakAndListen = (
   message: string,
   onResult: (result: string) => void,
@@ -118,7 +130,7 @@ const speakAndListen = (
   addMessage({ sender: 'doctor', text: message, timestamp: new Date() });
 };
 
-/** Custom hook for voice input with continuous retries */
+/** Custom hook for voice input with retry logic */
 const useVoiceInput = (
   addMessage: (msg: Message) => void,
   toggleMic: (active: boolean) => void,
@@ -134,7 +146,7 @@ const useVoiceInput = (
           const result: string = await new Promise((resolve) => {
             speakAndListen(promptMsg, resolve, addMessage, toggleMic, setCurrentPrompt);
           });
-          if (result) return result; // Return if we get a valid response
+          if (result) return result; // Return if valid response received
           throw new Error("No input detected");
         } catch (err) {
           attempts++;
@@ -146,7 +158,7 @@ const useVoiceInput = (
             const continueMsg = "I’m still having trouble hearing you. Let’s try one more time, or you can type if you prefer.";
             speak(continueMsg);
             addMessage({ sender: 'doctor', text: continueMsg, timestamp: new Date() });
-            attempts = 0; // Reset attempts and continue
+            attempts = 0; // Reset attempts
           }
         }
       }
@@ -157,18 +169,18 @@ const useVoiceInput = (
   return { voiceInput };
 };
 
-/** API Functions with Retries */
-async function extractSymptoms(transcript: string, retries = 3): Promise<string> {
+/** API function to extract full symptom summary with retries */
+async function extractSymptoms(transcript: string, retries = 3): Promise<SymptomSummary> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const response = await fetch(`${API_BASE_URL}/extract_symptoms`, {
+      const response = await fetch(`${API_BASE_URL}/extract_symptom_summary`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ transcript }),
       });
       if (!response.ok) throw new Error(`Attempt ${attempt} failed`);
       const data = await response.json();
-      return data.key_symptom;
+      return data.symptom_summary;
     } catch (error) {
       if (attempt === retries) throw new Error("Symptom extraction failed after retries");
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -177,9 +189,10 @@ async function extractSymptoms(transcript: string, retries = 3): Promise<string>
   throw new Error("Unexpected error in extractSymptoms");
 }
 
+/** API function to generate follow-up questions based on full symptom summary */
 async function generateFollowupQuestions(
   reviewed_transcript: string,
-  key_symptom: string,
+  symptom_summary: SymptomSummary,
   static_followup: { question: string; answer: string }[],
   retries = 3
 ): Promise<string[]> {
@@ -188,7 +201,7 @@ async function generateFollowupQuestions(
       const response = await fetch(`${API_BASE_URL}/generate_followup_questions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reviewed_transcript, key_symptom, static_followup }),
+        body: JSON.stringify({ reviewed_transcript, symptom_summary, static_followup }),
       });
       if (!response.ok) throw new Error(`Attempt ${attempt} failed`);
       const data = await response.json();
@@ -205,7 +218,7 @@ async function generateFollowupQuestions(
 const App: React.FC = () => {
   const [step, setStep] = useState<AppStep>('initial');
   const [transcript, setTranscript] = useState<string>('');
-  const [extractedSymptom, setExtractedSymptom] = useState<string>('');
+  const [symptomSummary, setSymptomSummary] = useState<SymptomSummary | null>(null);
   const [staticFollowUpQuestions, setStaticFollowUpQuestions] = useState<string[]>([]);
   const [staticFollowUpAnswers, setStaticFollowUpAnswers] = useState<string[]>([]);
   const [dynamicFollowUpQuestions, setDynamicFollowUpQuestions] = useState<string[]>([]);
@@ -235,12 +248,14 @@ const App: React.FC = () => {
     setCurrentPrompt
   );
 
+  // Auto-scroll to the latest conversation message
   useEffect(() => {
     conversationEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [conversation]);
 
   const addMessage = (msg: Message) => setConversation((prev) => [...prev, msg]);
 
+  // Memoized step indicator
   const getStepIndicator = useMemo(
     () => () => {
       switch (step) {
@@ -258,6 +273,7 @@ const App: React.FC = () => {
     [step]
   );
 
+  // Memoized progress percentage
   const getProgressPercentage = useMemo(
     () => () => {
       switch (step) {
@@ -275,6 +291,7 @@ const App: React.FC = () => {
     [step]
   );
 
+  // Loading message based on step
   const getLoadingMessage = (): string => {
     switch (step) {
       case 'followupLoading': return "We’re preparing some thoughtful questions to better understand how you’re doing.";
@@ -284,7 +301,7 @@ const App: React.FC = () => {
     }
   };
 
-  /** Handle Waiting Message During Loading */
+  /** Handle waiting message during long loading periods */
   useEffect(() => {
     if (loading && (step === 'followupLoading' || step === 'dynamicFollowupLoading' || step === 'final')) {
       waitingIntervalRef.current = window.setInterval(() => {
@@ -305,7 +322,7 @@ const App: React.FC = () => {
     };
   }, [loading, step]);
 
-  /** Overlay & Welcome */
+  /** Handle overlay and welcome message */
   const handleOverlayClick = () => {
     if (!welcomeSpoken) {
       speak("Hello there! We’re so glad you’re here. Whenever you’re ready, just tell us how you’re feeling, and we’ll create a care plan tailored just for you. Tap 'Let’s Begin' when you’re ready to start.");
@@ -323,7 +340,7 @@ const App: React.FC = () => {
     setStep('review');
   };
 
-  /** Review Step */
+  /** Review Step: Confirm transcript */
   useEffect(() => {
     if (step === 'review' && !isConfirmingRef.current && !isManuallyPaused) {
       isConfirmingRef.current = true;
@@ -350,7 +367,7 @@ const App: React.FC = () => {
     }
   }, [step, transcript, voiceInput, isManuallyPaused]);
 
-  /** Follow-Up Loading */
+  /** Follow-Up Loading: Extract symptoms and prepare static questions */
   useEffect(() => {
     if (step === 'followupLoading' && !isManuallyPaused) {
       window.speechSynthesis.cancel();
@@ -360,9 +377,9 @@ const App: React.FC = () => {
 
       (async () => {
         try {
-          const symptom = await extractSymptoms(transcript);
-          const cleanedSymptom = symptom.toLowerCase().trim().replace(/[^a-z]/g, "");
-          setExtractedSymptom(cleanedSymptom);
+          const summary = await extractSymptoms(transcript);
+          setSymptomSummary(summary);
+          const cleanedSymptom = summary.key_symptom.toLowerCase().trim().replace(/[^a-z]/g, "");
 
           const staticMapping: { [key: string]: string[] } = {
             fever: [
@@ -406,7 +423,7 @@ const App: React.FC = () => {
     }
   }, [step, transcript, isManuallyPaused]);
 
-  /** Static Follow-Up */
+  /** Static Follow-Up Questions */
   useEffect(() => {
     if (step === 'followup' && staticFollowUpQuestions.length > 0 && !isAskingStaticRef.current && !isManuallyPaused) {
       isAskingStaticRef.current = true;
@@ -432,7 +449,7 @@ const App: React.FC = () => {
     }
   }, [step, currentStaticIndex, staticFollowUpQuestions, staticFollowUpAnswers, voiceInput, isManuallyPaused]);
 
-  /** Dynamic Follow-Up */
+  /** Dynamic Follow-Up Questions */
   useEffect(() => {
     if (step === 'dynamicFollowupLoading' && !isLoadingDynamicRef.current && !isManuallyPaused) {
       isLoadingDynamicRef.current = true;
@@ -444,7 +461,7 @@ const App: React.FC = () => {
       (async () => {
         try {
           const staticQA = staticFollowUpQuestions.map((q, i) => ({ question: q, answer: staticFollowUpAnswers[i] }));
-          const questions = await generateFollowupQuestions(transcript, extractedSymptom, staticQA);
+          const questions = await generateFollowupQuestions(transcript, symptomSummary!, staticQA);
           setDynamicFollowUpQuestions(questions);
           setDynamicFollowUpAnswers(Array(questions.length).fill(""));
           setCurrentDynamicIndex(0);
@@ -480,9 +497,9 @@ const App: React.FC = () => {
         }
       })();
     }
-  }, [step, dynamicFollowUpQuestions, currentDynamicIndex, transcript, extractedSymptom, staticFollowUpQuestions, staticFollowUpAnswers, voiceInput, isManuallyPaused]);
+  }, [step, dynamicFollowUpQuestions, currentDynamicIndex, transcript, symptomSummary, staticFollowUpQuestions, staticFollowUpAnswers, voiceInput, isManuallyPaused]);
 
-  /** Final Guidelines */
+  /** Generate Final Guidelines */
   useEffect(() => {
     if (step === 'final' && !loading && !isManuallyPaused) {
       setLoading(true);
@@ -497,7 +514,7 @@ const App: React.FC = () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           transcript,
-          key_symptom: extractedSymptom,
+          symptom_summary: symptomSummary,
           follow_up: staticQA,
           dynamic_followup: dynamicQA
         })
@@ -522,12 +539,13 @@ const App: React.FC = () => {
           setLoading(false);
         });
     }
-  }, [step, transcript, extractedSymptom, staticFollowUpQuestions, staticFollowUpAnswers, dynamicFollowUpQuestions, dynamicFollowUpAnswers, isManuallyPaused]);
+  }, [step, transcript, symptomSummary, staticFollowUpQuestions, staticFollowUpAnswers, dynamicFollowUpQuestions, dynamicFollowUpAnswers, isManuallyPaused]);
 
+  /** Restart the application */
   const handleRestart = () => {
     setStep('initial');
     setTranscript('');
-    setExtractedSymptom('');
+    setSymptomSummary(null);
     setStaticFollowUpQuestions([]);
     setStaticFollowUpAnswers([]);
     setDynamicFollowUpQuestions([]);

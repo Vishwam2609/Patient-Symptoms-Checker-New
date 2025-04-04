@@ -1,6 +1,3 @@
-# NO MONKEY PATCH BLOCK HERE
-
-# Start with the normal imports
 import os
 import logging
 import gc
@@ -9,18 +6,16 @@ import shutil
 import re
 import base64
 import io
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pyngrok import ngrok
 import whisper
-# Ensure transformers and torch are imported for the main code
-import transformers # Keep this if needed below
-import torch # Keep this
+import transformers
+import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from gtts import gTTS
-# torch is already imported above
-
-# ... (rest of your code from the previous correct answer) ...
+import json
 
 # Use GPU if available
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -36,10 +31,15 @@ logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 CORS(app)
 
-NGROK_AUTH_TOKEN = "2sZL5k5FBMPppi3zC5xRRYuG5IP_6BiBZ5A9ee77WTxAfVWqa" # Consider moving this to an environment variable
+NGROK_AUTH_TOKEN = os.getenv("NGROK_AUTH_TOKEN", "2sZL5k5FBMPppi3zC5xRRYuG5IP_6BiBZ5A9ee77WTxAfVWqa")
 ngrok.set_auth_token(NGROK_AUTH_TOKEN)
 
-# LLMHandler class definition (Keep as is)
+# Request counter for periodic GPU cleanup
+request_counter = 0
+
+# Thread pool executor for offloading blocking tasks
+executor = ThreadPoolExecutor(max_workers=2)
+
 class LLMHandler:
     def __init__(self):
         self.tokenizer = None
@@ -55,8 +55,7 @@ class LLMHandler:
             except OSError as e:
                 logger.error(f"Error clearing cache directory {CACHE_DIR}: {e}")
         else:
-             os.makedirs(CACHE_DIR, exist_ok=True) # Ensure cache dir exists if not present
-
+            os.makedirs(CACHE_DIR, exist_ok=True)
 
     def load_model(self):
         if self.pipeline is None:
@@ -64,63 +63,51 @@ class LLMHandler:
                 logger.info("Clearing model cache before loading LLM...")
                 self.clear_model_cache()
                 logger.info("Loading LLM model...")
-                # Consider using environment variables more robustly or directly passing the token
                 HUGGING_FACE_TOKEN = os.getenv("HUGGING_FACE_TOKEN", "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")
                 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "ContactDoctor/Bio-Medical-Llama-3-2-1B-CoT-012025")
-
-                # Use the token if provided
                 use_auth_token_value = HUGGING_FACE_TOKEN if HUGGING_FACE_TOKEN else None
 
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     LLM_MODEL_NAME,
-                    token=use_auth_token_value, # Use 'token' instead of 'use_auth_token' for newer versions
+                    token=use_auth_token_value,
                     force_download=True,
-                    use_fast=False, # Keep False if required by model/trust_remote_code
+                    use_fast=False,
                     trust_remote_code=True,
                     cache_dir=CACHE_DIR
                 )
                 self.model = AutoModelForCausalLM.from_pretrained(
                     LLM_MODEL_NAME,
-                    token=use_auth_token_value, # Use 'token' instead of 'use_auth_token'
+                    token=use_auth_token_value,
                     torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
                     force_download=True,
                     trust_remote_code=True,
                     cache_dir=CACHE_DIR
-                    # Removed the problematic load_state_dict call source
                 )
                 self.pipeline = pipeline(
                     "text-generation",
                     model=self.model,
                     tokenizer=self.tokenizer,
-                    device=0 if DEVICE == "cuda" else -1 # Use device mapping
+                    device=0 if DEVICE == "cuda" else -1
                 )
                 logger.info("LLM model loaded successfully.")
             except Exception as e:
                 logger.error("Error loading LLM model", exc_info=True)
-                # Re-raise the exception so the calling function knows loading failed
-                raise e # Re-raise
+                raise e
 
-    # generate_text method (Keep as is)
     def generate_text(self, prompt, max_new_tokens, num_beams, temperature, repetition_penalty, early_stopping=True) -> str:
+        global request_counter
         if self.pipeline is None:
-            try: # Add try-except around load_model here
+            try:
                 self.load_model()
-            except Exception as e: # Catch specific loading errors
-                 logger.error("LLM pipeline is not available because model loading failed.", exc_info=True)
-                 # Return an empty string or raise a custom error to indicate failure upstream
-                 return f"Error: Model could not be loaded. {e}" # Or raise specific exception
-
-        # Check again after attempting to load
-        if self.pipeline is None:
-             logger.error("LLM pipeline is still not available after attempting to load.")
-             return "Error: Model pipeline could not be initialized."
+            except Exception as e:
+                logger.error("LLM pipeline is not available because model loading failed.", exc_info=True)
+                return f"Error: Model could not be loaded. {e}"
 
         try:
             logger.info("Generating text from LLM...")
-            # Ensure prompt is a string or list of strings
             if not isinstance(prompt, (str, list)):
-                 logger.error(f"Invalid prompt type: {type(prompt)}. Prompt must be str or list.")
-                 return "Error: Invalid prompt format."
+                logger.error(f"Invalid prompt type: {type(prompt)}. Prompt must be str or list.")
+                return "Error: Invalid prompt format."
 
             pipeline_output = self.pipeline(
                 prompt,
@@ -129,544 +116,618 @@ class LLMHandler:
                 early_stopping=early_stopping,
                 temperature=temperature,
                 repetition_penalty=repetition_penalty,
-                # Add pad_token_id if tokenizer doesn't have it set (common issue)
                 pad_token_id=self.tokenizer.eos_token_id if self.tokenizer.pad_token_id is None else self.tokenizer.pad_token_id
-            ) or [] # Ensure pipeline_output is not None
+            ) or []
 
-            # Handle potential variations in pipeline output format
             if not pipeline_output:
-                 logger.warning("LLM pipeline returned an empty result.")
-                 return ""
+                logger.warning("LLM pipeline returned an empty result.")
+                return ""
 
-            # Expecting a list of dictionaries
-            if isinstance(pipeline_output, list) and pipeline_output and isinstance(pipeline_output[0], dict):
-                 generated_text = pipeline_output[0].get('generated_text', "")
-            # Handle cases where it might return just a list of strings (less common for text-generation)
-            elif isinstance(pipeline_output, list) and pipeline_output and isinstance(pipeline_output[0], str):
-                 generated_text = pipeline_output[0]
-            else:
-                 logger.warning(f"Unexpected LLM pipeline output format: {type(pipeline_output)}. Output: {pipeline_output}")
-                 # Attempt to convert to string as a fallback
-                 generated_text = str(pipeline_output[0]) if pipeline_output else ""
-
-            # Clean the generated text from the prompt if needed
+            generated_text = pipeline_output[0].get('generated_text', "")
             if isinstance(prompt, str) and generated_text.startswith(prompt):
-                 # Remove the prompt part from the beginning of the generated text
-                 # This is often needed as the pipeline includes the input prompt
-                 generated_text = generated_text[len(prompt):]
+                generated_text = generated_text[len(prompt):]
+
+            # Periodic GPU cleanup
+            request_counter += 1
+            if DEVICE == "cuda" and request_counter % 10 == 0:
+                torch.cuda.empty_cache()
+                logger.info("Periodic GPU memory cleanup performed.")
 
             return generated_text.strip() if generated_text else ""
         except Exception as e:
             logger.error("LLM generation error", exc_info=True)
-            # Return error message or empty string
             return f"Error during text generation: {e}"
 
-    # generate_followup_questions method (REVISED)
-    def generate_followup_questions(self, reviewed_transcript: str, key_symptom: str, static_followup: list) -> list:
+    def extract_structured_symptoms(self, transcript: str) -> dict:
         """
-        Dynamically generates exactly three distinct and clinically relevant follow-up questions
-        based on the patient's transcript and key symptom. These questions MUST explore
-        key aspects of the symptom NOT conceptually covered by the static questions.
-
-        Focuses on standard clinical dimensions like:
-        - Severity/Intensity (Scale, impact on function)
-        - Character/Quality (Description: sharp, dull, constant, intermittent, etc.)
-        - Onset/Timing/Frequency (When did it start? How often? Pattern?)
-        - Location/Radiation (Where is it? Does it spread? - If applicable)
-        - Triggers/Aggravating/Relieving Factors (What makes it better or worse?)
-        - Impact on Daily Life (Effect on activities, work, sleep)
-        - Associated Symptoms (Specific, relevant ones beyond generics if generics covered)
-        - Treatments Tried/Relief Measures (What has the patient done?)
-
-        Avoids repeating topics clearly addressed by static questions.
-        Outputs exactly three unique questions, one per line, ending with a question mark.
+        Uses the LLM to extract a structured summary of symptoms from a patient transcript.
+        Extracts key symptom, severity, onset/duration, location, character, and associated symptoms in a generalized manner.
         """
-        # --- Topic Analysis Helper ---
+        # Generalized prompt without specific symptom examples
+        prompt = (
+            "You are a medical assistant tasked with analyzing a patient's initial statement.\n"
+            "Extract the following details from the description provided:\n"
+            "- key_symptom: The primary health complaint or most prominent symptom the patient mentions (e.g., a single noun or short phrase like 'fever', 'pain', 'coughing'). Identify the main focus of their concern.\n"
+            "- severity: How intense or bad the primary symptom is (e.g., 'severe', 'mild', 'getting worse'). Use 'not specified' if not mentioned.\n"
+            "- onset_duration: When the symptom began or how long it has persisted (e.g., 'since yesterday', 'for 2 weeks'). Use 'not specified' if not mentioned.\n"
+            "- location: The part of the body affected by the primary symptom (e.g., 'chest', 'whole body'). Use 'not specified' if not mentioned.\n"
+            "- character: The quality or nature of the primary symptom (e.g., 'sharp', 'dull', 'throbbing'). Use 'not specified' if not mentioned.\n"
+            "- associated_symptoms: Any additional symptoms mentioned alongside the primary one (e.g., 'nausea', 'fatigue'). Use 'none mentioned' if none are noted.\n\n"
+            f"Patient Description: \"{transcript}\"\n\n"
+            "Carefully analyze the description to determine the most prominent symptom as the key_symptom. "
+            "Output ONLY a valid JSON object containing these fields, with values as strings. "
+            "Ensure the output is concise and directly reflects the patient’s statement.\n\n"
+            "JSON Output:"
+        )
+
+        # Optimized parameters for generalized, reliable JSON output
+        raw_output = self.generate_text(
+            prompt,
+            max_new_tokens=300,  # Increased to handle complex inputs
+            num_beams=1,         # Single beam for simplicity and speed
+            temperature=0.3,     # Balanced for consistency without over-rigidity
+            repetition_penalty=1.2  # Reduce repetition for clearer output
+        )
+
+        # Default summary structure
+        summary = {
+            "key_symptom": "unknown symptom",
+            "severity": "not specified",
+            "onset_duration": "not specified",
+            "location": "not specified",
+            "character": "not specified",
+            "associated_symptoms": "none mentioned"
+        }
+
+        try:
+            # Clean markdown or extra formatting
+            cleaned_output = re.sub(r"```json\s*([\s\S]*?)\s*```", r"\1", raw_output).strip()
+            parsed_json = json.loads(cleaned_output)
+
+            if isinstance(parsed_json, dict):
+                # Handle potential key variations
+                key_mapping = {
+                    "main_symptom": "key_symptom",
+                    "primary_symptom": "key_symptom",
+                    "chief_complaint": "key_symptom",
+                    "main_issue": "key_symptom"
+                }
+                for alt_key, standard_key in key_mapping.items():
+                    if alt_key in parsed_json and standard_key not in parsed_json:
+                        parsed_json[standard_key] = parsed_json.pop(alt_key)
+
+                # Update summary with parsed values
+                for key in summary.keys():
+                    if key in parsed_json and isinstance(parsed_json[key], str) and parsed_json[key].strip():
+                        summary[key] = parsed_json[key].strip()
+
+                # Validate key_symptom
+                if not summary["key_symptom"] or summary["key_symptom"].lower() in ["not specified", "unknown", ""]:
+                    raise ValueError("Key symptom not adequately identified by LLM")
+
+            logger.info(f"Successfully extracted symptom summary: {summary}")
+            return summary
+
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"LLM output parsing/validation error: {e}. Raw output: '{raw_output}'")
+            
+            # Fallback: Use regex-based extraction for each field.
+            transcript_lower = transcript.lower()
+            
+            # Broader symptom detection with a regex pattern.
+            # Using re.findall to capture all occurrences so that we can select the most relevant one.
+            symptom_pattern = r"\b(fever|headache|cough|coughing|pain|ache|sore|nausea|dizziness|fatigue|shortness of breath|vomiting|diarrhea|rash|chills|congestion|swelling|itching|bleeding|weakness)\b"
+            symptom_matches = re.findall(symptom_pattern, transcript_lower)
+            if symptom_matches:
+                # Choose the last match as the primary symptom (helps when adjectives precede the symptom)
+                summary["key_symptom"] = symptom_matches[-1]
+
+            # Extract severity
+            severity_pattern = r"\b(severe|mild|bad|terrible|awful|slight|moderate|extreme|worse|better|intense|[0-9]+/[0-9]+)\b"
+            severity_match = re.search(severity_pattern, transcript_lower)
+            if severity_match:
+                summary["severity"] = severity_match.group(0)
+
+            # Extract onset/duration
+            onset_pattern = r"\b(since|yesterday|today|for\s+\d+\s+(days?|weeks?|months?)|last\s+\w+|over\s+the\s+weekend|recently|suddenly|started|ongoing)\b"
+            onset_match = re.search(onset_pattern, transcript_lower)
+            if onset_match:
+                summary["onset_duration"] = onset_match.group(0)
+
+            # Extract location
+            location_pattern = r"\b(head|neck|throat|chest|back|stomach|abdomen|arm|leg|hand|foot|all\s+over|whole\s+body|side|left|right|upper|lower)\b"
+            location_match = re.search(location_pattern, transcript_lower)
+            if location_match:
+                summary["location"] = location_match.group(0)
+
+            # Extract character
+            character_pattern = r"\b(sharp|dull|throbbing|pounding|burning|stabbing|aching|tight|sore|constant|off\s+and\s+on|intermittent)\b"
+            character_match = re.search(character_pattern, transcript_lower)
+            if character_match:
+                summary["character"] = character_match.group(0)
+
+            # Extract associated symptoms (secondary occurrences excluding the primary symptom)
+            assoc_matches = [m for m in re.findall(symptom_pattern, transcript_lower) if m != summary["key_symptom"]]
+            if assoc_matches:
+                summary["associated_symptoms"] = ", ".join(assoc_matches)
+
+            # Final LLM-based fallback if key symptom is still missing
+            if summary["key_symptom"] == "unknown symptom":
+                fallback_prompt = (
+                    "You are a medical assistant. Identify the most prominent symptom or health issue from this patient description in a few words.\n\n"
+                    f"Patient Description: \"{transcript}\"\nPrimary Symptom:"
+                )
+                fallback_symptom = self.generate_text(
+                    fallback_prompt,
+                    max_new_tokens=15,
+                    num_beams=2,
+                    temperature=0.5,
+                    repetition_penalty=1.1
+                )
+                if fallback_symptom and not fallback_symptom.startswith("Error:"):
+                    summary["key_symptom"] = fallback_symptom.strip()
+
+            logger.warning(f"Using regex fallback for symptom extraction: {summary}")
+            return summary
+
+        except Exception as e:
+            logger.error(f"Unexpected error during symptom extraction: {e}", exc_info=True)
+            logger.warning(f"Returning default summary: {summary}")
+            return summary
+
+    # --- Final generate_followup_questions function --
+    def generate_followup_questions(self, reviewed_transcript: str, symptom_summary: dict, static_followup: list) -> list:
+        """
+        Generates three distinct, clinically relevant follow-up questions based on
+        an initial transcript, a structured symptom summary, and previous static questions.
+        Output questions do not have leading numbers or bullets.
+        """
+        # --- Get Key Symptom for fallbacks/logging ---
+        key_symptom = symptom_summary.get('key_symptom', 'the symptom') # Use from summary
+
+        # --- Define get_question_topic (no change needed here) ---
         def get_question_topic(question_text):
+            # (Keep your existing get_question_topic function)
             q_lower = question_text.lower()
-            # Severity
-            if any(kw in q_lower for kw in ["scale of 1 to 10", "how severe", "how bad", "intensity"]):
-                return "Severity"
-            # Character/Quality
-            if any(kw in q_lower for kw in ["describe", "quality", "character", "feel like", "sharp", "dull", "throbbing", "burning", "constant", "intermittent"]):
-                return "Character"
-            # Onset/Timing/Frequency
-            if any(kw in q_lower for kw in ["when did", "start", "began", "first time", "how long", "how often", "frequency", "pattern", "timing"]):
-                return "Onset/Timing"
-            # Triggers/Aggravating/Relieving
-            if any(kw in q_lower for kw in ["trigger", "worsen", "aggravate", "better", "improve", "relieve", "help", "specific activities", "food", "position"]):
-                return "Triggers/Relief"
-            # Impact on Daily Life
-            if any(kw in q_lower for kw in ["affect", "impact", "daily activities", "daily life", "work", "sleep", "function"]):
-                return "Impact"
-            # Location/Radiation (less common for all symptoms, but possible)
-            if any(kw in q_lower for kw in ["where", "location", "point to", "spread", "radiate"]):
-                return "Location"
-            # Associated Symptoms (check for specifics beyond generic ones often covered initially)
-            if any(kw in q_lower for kw in ["other symptoms", "anything else with", "coughing up", "accompanied by"]):
-                 # Check if it's just a generic 'any other symptoms' which might overlap easily
-                 if "any other symptoms" in q_lower or "anything else" in q_lower:
-                     return "Assoc. Generic"
-                 return "Assoc. Specific"
-            # Treatments Tried
-            if any(kw in q_lower for kw in ["tried", "taken anything", "treatment", "medication", "remedies"]):
-                return "Treatments Tried"
-            return "Other" # Default category
+            if any(kw in q_lower for kw in ["scale of 1 to 10", "how severe", "how bad", "intensity"]): return "Severity"
+            if any(kw in q_lower for kw in ["describe", "quality", "feel like", "sharp", "dull", "constant", "intermittent"]): return "Character"
+            if any(kw in q_lower for kw in ["when did", "start", "how long", "how often", "frequency", "pattern"]): return "Onset/Timing"
+            if any(kw in q_lower for kw in ["where", "location", "point to", "spread", "radiate"]): return "Location"
+            if any(kw in q_lower for kw in ["trigger", "worsen", "better", "relieve", "help", "specific activities"]): return "Triggers/Relief"
+            if any(kw in q_lower for kw in ["affect", "impact", "daily", "work", "sleep", "function"]): return "Impact"
+            if any(kw in q_lower for kw in ["other symptoms", "anything else", "accompanied by"]): return "Associated Symptoms"
+            if any(kw in q_lower for kw in ["tried", "taken anything", "treatment", "medication", "remedies"]): return "Treatments Tried"
+            return "Other"
 
-        # --- Identify Topics Covered by Static Questions ---
+        # --- Static Question Processing (no change needed here) ---
         static_questions_text = [item.get('question', '').strip() for item in static_followup if isinstance(item, dict) and item.get('question')]
-        static_topics_covered = set()
-        for q_text in static_questions_text:
-            topic = get_question_topic(q_text)
-            if topic != "Other":
-                static_topics_covered.add(topic)
-        logger.info(f"Static questions cover topics: {static_topics_covered}")
-
-        # --- Prepare Context for LLM ---
+        static_topics_covered = set(get_question_topic(q) for q in static_questions_text if get_question_topic(q) != "Other")
         static_questions_context = "\n".join([f"- {q}" for q in static_questions_text]) if static_questions_text else "None provided."
 
+        # --- Topic Selection Logic (no change needed here) ---
+        all_topics_ordered = ["Severity", "Character", "Onset/Timing", "Location", "Triggers/Relief", "Associated Symptoms", "Impact", "Treatments Tried"]
+        uncovered_topics = [topic for topic in all_topics_ordered if topic not in static_topics_covered]
+        # (Keep fallback logic for uncovered_topics if len < 3)
+        if len(uncovered_topics) < 3:
+             fallback_suggestions = ["Impact", "Treatments Tried", "Associated Symptoms"]
+             needed = 3 - len(uncovered_topics)
+             added_count = 0
+             for fb_topic in fallback_suggestions:
+                 if added_count < needed and fb_topic not in uncovered_topics and fb_topic not in static_topics_covered:
+                     uncovered_topics.append(fb_topic)
+                     added_count += 1
+             idx = 0
+             while len(uncovered_topics) < 3:
+                 topic_candidate = all_topics_ordered[idx % len(all_topics_ordered)]
+                 if topic_candidate not in uncovered_topics:
+                      uncovered_topics.append(topic_candidate)
+                 idx += 1
+
+
+        # --- **MODIFIED**: Build Richer Context for the Prompt ---
+        initial_summary_text = (
+            f"- Main Complaint: {symptom_summary.get('key_symptom', 'Not specified')}\n"
+            f"- Severity Mentioned: {symptom_summary.get('severity', 'Not specified')}\n"
+            f"- Onset/Duration Mentioned: {symptom_summary.get('onset_duration', 'Not specified')}\n"
+            f"- Location Mentioned: {symptom_summary.get('location', 'Not specified')}\n"
+            f"- Character Mentioned: {symptom_summary.get('character', 'Not specified')}\n"
+            f"- Associated Symptoms Mentioned: {symptom_summary.get('associated_symptoms', 'Not specified')}"
+        )
+
         context_for_llm = (
-            f"Patient's description: {reviewed_transcript}\n"
-            f"Key symptom: {key_symptom}\n"
-            "Static Follow-up Questions Already Asked (DO NOT repeat topics covered below):\n"
+            f"Patient's Initial Statement Analysis:\n{initial_summary_text}\n"
+            f"(Full Transcript: \"{reviewed_transcript}\")\n\n" # Keep full transcript for nuance
+            "Static Follow-up Questions Already Asked (DO NOT repeat questions on these topics):\n"
             f"{static_questions_context}\n"
-            f"Topics already covered by static questions: {', '.join(static_topics_covered) if static_topics_covered else 'None'}\n"
+            f"Topics covered by static questions: {', '.join(static_topics_covered) if static_topics_covered else 'None'}\n"
         )
 
-        # --- Define the Prompt for the LLM ---
+        # --- **MODIFIED**: Update Prompt with Richer Context ---
         prompt = (
-            "You are an experienced clinician performing a *focused secondary inquiry*. Your goal is to generate exactly three **clinically insightful** and **distinct** follow-up questions about the key symptom, based *only* on the context below. "
-            "These questions MUST investigate aspects **NOT already covered** by the static questions listed or the topics identified as covered. "
-            "Prioritize questions that explore potentially uncovered clinical dimensions like:\n"
-            "- **Severity/Intensity:** (e.g., 'On a scale of 1-10, how severe is the [symptom] at its worst?' or 'How does this [symptom] interfere with your ability to [specific activity]?')\n"
-            "- **Character/Quality:** (e.g., 'Can you describe the [symptom] in more detail? Is it sharp, dull, aching, burning, constant, or does it come and go?')\n"
-            "- **Triggers/Aggravating/Relieving Factors:** (e.g., 'What specifically seems to make the [symptom] worse or better? Think about activities, time of day, foods, or positions.')\n"
-            "- **Impact on Daily Life:** (e.g., 'How is the [symptom] specifically affecting your work, sleep, or ability to do daily tasks?')\n"
-            "- **Relevant Associated Symptoms:** (e.g., If symptom is cough, 'Are you coughing anything up? If so, what color is it?' - Avoid generic 'any other symptoms?' if already asked).\n"
-            "- **Treatments Tried:** (e.g., 'Have you tried any specific remedies or medications for this [symptom], and what was the effect?')\n\n"
-            f"Do NOT ask about topics already covered ({', '.join(static_topics_covered) if static_topics_covered else 'None'}). "
-            "Ensure each question is unique in the information it seeks, uses clear patient-friendly language, ends with a question mark, and probes for useful details. "
-            "Output ONLY the three questions, one per line.\n\n"
-            f"Context:\n{context_for_llm}\n"
-            "### OUTPUT:"
+            "You are a clinical assistant reviewing initial patient information and planning follow-up questions.\n"
+            "Based on the analyzed initial statement and the static questions already asked (context below), generate exactly THREE distinct, open-ended follow-up questions "
+            f"to further investigate the patient's condition, focusing on the main complaint: '{key_symptom}'.\n"
+            "Ensure the questions are patient-friendly, end with a question mark, and explore different clinical aspects.\n"
+            "Crucially, AVOID asking about topics already well-covered by the 'Static Follow-up Questions' or clearly detailed in the 'Initial Statement Analysis'.\n"
+            "Focus on gathering more details about these potentially uncovered areas:\n"
+            f"1. {uncovered_topics[0]} (e.g., Ask about specific triggers, character, or impact if not detailed)\n"
+            f"2. {uncovered_topics[1]} (e.g., Ask about treatments tried, associated symptoms, or timing patterns if unclear)\n"
+            f"3. {uncovered_topics[2]} (e.g., Ask clarifying questions based on initial details or explore less covered areas)\n"
+            "Phrase your questions naturally. Output ONLY the three questions, each on a new line. Do NOT add numbers like '1.' or bullets like '-' to the beginning of the questions.\n\n"
+            f"### Context:\n{context_for_llm}\n"
+            "### OUTPUT (3 Questions, plain text, one per line):"
         )
 
-        # --- Generate Text using LLM ---
-        result = self.generate_text(prompt, max_new_tokens=180, num_beams=5, temperature=0.65, repetition_penalty=1.2)
+        # --- LLM Call and Post-processing (Keep the existing logic) ---
+        result = self.generate_text(prompt, max_new_tokens=150, num_beams=3, temperature=0.6, repetition_penalty=1.2) # Or use FOLLOWUP_PARAMS
+        generated_questions_raw = [line.strip() for line in result.split("\n") if line.strip() and line.strip().endswith("?")]
 
-        # --- Process and Validate Generated Questions ---
-        generated_questions = []
-        if result and not result.startswith("Error:"):
-            lines = [line.strip() for line in result.split("\n") if line.strip()]
-            for q in lines:
-                q = re.sub(r'^[A-Z]:\s*', '', q)
-                q = re.sub(r'^\s*Dynamic Follow-Up\s*\(\s*\d+\s+of\s+\d+\s*\)\s*:?\s*', '', q, flags=re.IGNORECASE)
-                q = re.sub(r'^[\d\.\-\)\s]+', '', q) # Remove leading list markers
-                q = q.strip()
-                if q:
-                    if not q.endswith('?'):
-                        q += '?'
-                    # Basic check for relevance (contains symptom or generic pronoun)
-                    if key_symptom.lower() in q.lower() or any(pronoun in q.lower() for pronoun in [' it', ' this', ' symptom']):
-                        generated_questions.append(q)
-                    else:
-                        logger.warning(f"Filtering out potentially irrelevant generated question: '{q}' for symptom '{key_symptom}'")
-
-        # --- Filter and Select Distinct Questions ---
         distinct_questions = []
-        seen_topics = set(static_topics_covered) # Start with topics covered by static questions
-        seen_question_texts_lower = {q.lower() for q in static_questions_text}
+        seen_topics = set(static_topics_covered)
+        # Also consider topics mentioned in initial summary as partially covered
+        for key, value in symptom_summary.items():
+            if value.lower() != 'not specified' and value.lower() != 'none mentioned':
+                topic = get_question_topic(f"{key}: {value}") # Rough topic mapping
+                if topic != "Other":
+                    seen_topics.add(topic)
 
-        for q in generated_questions:
-            q_lower = q.lower()
-            q_topic = get_question_topic(q)
+        seen_questions_text = set(q.lower() for q in static_questions_text)
 
-            # Check 1: Is it a duplicate of a static question (textual)?
-            is_duplicate_static = q_lower in seen_question_texts_lower
+        # (Keep the filtering logic for generated_questions_raw, using seen_topics and seen_questions_text)
+        for q in generated_questions_raw:
+             q_lower = q.lower()
+             is_similar_to_static = any(q_lower in static_q.lower() or static_q.lower() in q_lower for static_q in static_questions_text)
+             if is_similar_to_static: continue
 
-            # Check 2: Does it cover a topic already covered (by static or previous dynamic)?
-            is_topic_covered = q_topic in seen_topics and q_topic != "Other" # Allow multiple 'Other' questions if needed
+             topic = get_question_topic(q)
+             cleaned_q = re.sub(r"^\s*(\d+\.|\*|-)\s*", "", q).strip()
+             if not cleaned_q: continue
 
-            if not is_duplicate_static and not is_topic_covered:
-                distinct_questions.append(q)
-                seen_topics.add(q_topic)
-                seen_question_texts_lower.add(q_lower) # Add to check against future generated ones too
-                if len(distinct_questions) == 3:
-                    break # Stop once we have 3 distinct questions
+             cleaned_q_lower = cleaned_q.lower()
+             # Check if topic is truly new *and* question text is new
+             if topic not in seen_topics and cleaned_q not in distinct_questions and cleaned_q_lower not in seen_questions_text:
+                 distinct_questions.append(cleaned_q)
+                 seen_questions_text.add(cleaned_q_lower)
+                 if topic != "Other": seen_topics.add(topic)
+             # Allow adding if topic was seen but question is different (less preferred)
+             elif topic in seen_topics and cleaned_q not in distinct_questions and cleaned_q_lower not in seen_questions_text:
+                  distinct_questions.append(cleaned_q)
+                  seen_questions_text.add(cleaned_q_lower)
 
-        # --- Generate Fallback Questions if Needed ---
-        if len(distinct_questions) < 3:
-            logger.warning(f"LLM generated only {len(distinct_questions)} distinct, non-redundant questions covering new topics. Adding fallbacks.")
+             if len(distinct_questions) == 3: break
 
-            # Define potential fallback topics and standard questions
-            fallback_options = {
-                "Severity": f"On a scale of 1 to 10, with 10 being the worst imaginable, how severe is your {key_symptom} right now?",
-                "Character": f"Can you describe the {key_symptom}? For example, is it sharp, dull, aching, burning, constant, or intermittent?",
-                "Triggers/Relief": f"Is there anything specific you've noticed that makes the {key_symptom} better or worse (like activity, rest, food, position)?",
-                "Impact": f"How is this {key_symptom} impacting your daily activities, such as work, sleep, or hobbies?",
-                "Treatments Tried": f"Have you tried taking or doing anything to relieve the {key_symptom}? If so, did it help?",
-                 # Add Onset/Timing only if truly fundamental and missed
-                # "Onset/Timing": f"Just to confirm, when exactly did this {key_symptom} start, and has it changed since then?"
-            }
+        # --- Fallback Question Generation (Use key_symptom extracted earlier) ---
+        fallback_options = {
+            # (Keep your fallback_options dictionary, it uses key_symptom correctly)
+             "Severity": f"On a scale of 1 to 10, how would you rate the severity of your {key_symptom} right now?",
+             "Character": f"Can you describe what the {key_symptom} feels like? For example, is it sharp, dull, burning, aching?",
+             # ... rest of fallbacks
+             "Treatments Tried": f"Have you tried any medications or home remedies for this {key_symptom}, and did they help?"
+        }
 
-            # Prioritize topics not covered yet
-            potential_fallback_topics = ["Severity", "Character", "Triggers/Relief", "Impact", "Treatments Tried"] # Order matters slightly
+        final_uncovered_topics = [topic for topic in all_topics_ordered if topic not in seen_topics]
 
-            for topic in potential_fallback_topics:
-                if topic not in seen_topics:
-                    fallback_q = fallback_options[topic]
-                    fallback_q_lower = fallback_q.lower()
-                    # Final check to prevent adding a fallback that's somehow textually identical to a static one
-                    if fallback_q_lower not in seen_question_texts_lower:
-                         distinct_questions.append(fallback_q)
-                         seen_topics.add(topic) # Mark topic as covered by fallback
-                         seen_question_texts_lower.add(fallback_q_lower)
-                         if len(distinct_questions) == 3:
-                              break
-
-        # Fallback if STILL less than 3 (highly unlikely now, but safe)
-        if len(distinct_questions) < 3:
-             logger.error("Could not generate 3 distinct follow-up questions even with fallbacks. Returning generic defaults.")
-             generic_defaults = [
-                  f"On a scale of 1 to 10, how severe is the {key_symptom}?",
-                  f"Can you describe the {key_symptom} in more detail (e.g., sharp, dull, constant)?",
-                  f"Does anything seem to make the {key_symptom} better or worse?",
-             ]
-             # Add only enough to reach 3, avoiding duplicates if possible
-             existing_lower = {q.lower() for q in distinct_questions}
-             for qd in generic_defaults:
-                 if len(distinct_questions) < 3 and qd.lower() not in existing_lower:
-                     distinct_questions.append(qd)
+        # (Keep the fallback filling logic)
+        idx = 0
+        while len(distinct_questions) < 3 and idx < len(final_uncovered_topics):
+            # ... (fill with fallbacks) ...
+             topic_to_add = final_uncovered_topics[idx]
+             fallback_question = fallback_options.get(topic_to_add)
+             if fallback_question and fallback_question not in distinct_questions and fallback_question.lower() not in seen_questions_text:
+                 distinct_questions.append(fallback_question)
+                 seen_topics.add(topic_to_add)
+                 seen_questions_text.add(fallback_question.lower())
+             idx += 1
+        # ... (fill with generic fallbacks if needed) ...
+        generic_fallbacks = [
+             f"Can you tell me a bit more about the {key_symptom}?",
+             f"Is there anything else important about the {key_symptom} I should know?",
+             f"How concerned are you about this {key_symptom}?"
+        ]
+        idx = 0
+        while len(distinct_questions) < 3 and idx < len(generic_fallbacks):
+             if generic_fallbacks[idx] not in distinct_questions and generic_fallbacks[idx].lower() not in seen_questions_text:
+                 distinct_questions.append(generic_fallbacks[idx])
+                 seen_questions_text.add(generic_fallbacks[idx].lower())
+             idx += 1
 
 
-        logger.info(f"Final distinct follow-up questions: {distinct_questions[:3]}")
-        return distinct_questions[:3] # Return exactly the first 3
+        # --- Final Cleaning (Keep the existing logic) ---
+        final_cleaned_questions = []
+        for q in distinct_questions[:3]:
+            # (clean leading markers)
+             cleaned_q = re.sub(r"^\s*(\d+\.|\*|-)\s*", "", q).strip()
+             if cleaned_q:
+                 final_cleaned_questions.append(cleaned_q)
 
-    # generate_guidelines method (Keep as is, but add error check for generate_text)
-    def generate_guidelines(self, reviewed_transcript: str, key_symptom: str, static_followup: list, dynamic_followup: list) -> str:
+
+        logger.info(f"Generated dynamic questions using richer context (final cleaned): {final_cleaned_questions}")
+        return final_cleaned_questions
+
+    # --- Final generate_guidelines function ---
+    # Replace the old generate_guidelines method
+    def generate_guidelines(self, reviewed_transcript: str, symptom_summary: dict, static_followup: list, dynamic_followup: list) -> str:
         """
-        Generates a concise, patient-friendly home care plan in one paragraph of approximately 150 words.
-        The guidelines consider the patient's reviewed transcript, extracted key symptom, static follow-up Q&A,
-        and dynamic follow-up Q&A. The plan focuses on specific home care strategies the patient can follow
-        to get relief from the reported symptom.
+        Generates a personalized home care plan based on the patient's conversation and symptom analysis.
+        
+        This function builds a detailed prompt from:
+          - The structured symptom summary.
+          - The full reviewed transcript.
+          - Static and dynamic follow-up Q&A.
+        
+        The LLM is then used to generate a single, flowing paragraph (approximately 100-150 words) with plain text advice.
+        The advice includes general care recommendations, specific non-pharmacological suggestions, possible OTC options, 
+        modifications to activities, and red flag conditions that would require further medical evaluation.
+        
+        A standard disclaimer is appended to the result. If the LLM fails or returns an empty result, a fallback guideline 
+        is used based on the primary symptom.
+        
+        Args:
+            reviewed_transcript (str): The full transcript of the patient consultation.
+            symptom_summary (dict): A dictionary with keys such as 'key_symptom', 'severity', 'onset_duration', 'location', 
+                                    'character', and 'associated_symptoms'.
+            static_followup (list): A list of dictionaries for static follow-up Q&A.
+            dynamic_followup (list): A list of dictionaries for dynamic follow-up Q&A.
+        
+        Returns:
+            str: A single paragraph of personalized home care advice with an appended disclaimer.
         """
-        # Ensure follow-up items are dicts with 'question' and 'answer' keys
+        # Retrieve key symptom from summary, with a fallback label.
+        key_symptom = symptom_summary.get('key_symptom', 'the symptom')
+
+        # Format static follow-up questions and answers.
         static_followup_text = "\n".join(
-            [f"Q: {item.get('question', '')}\nA: {item.get('answer', '')}" for item in static_followup if isinstance(item, dict)]
+            f"- Q: {item.get('question', '').strip()}\n  A: {item.get('answer', '').strip()}"
+            for item in static_followup if isinstance(item, dict) and item.get('question') and item.get('answer')
         )
+
+        # Format dynamic follow-up questions and answers.
         dynamic_followup_text = "\n".join(
-            [f"Q: {item.get('question', '')}\nA: {item.get('answer', '')}" for item in dynamic_followup if isinstance(item, dict)]
+            f"- Q: {item.get('question', '').strip()}\n  A: {item.get('answer', '').strip()}"
+            for item in dynamic_followup if isinstance(item, dict) and item.get('question') and item.get('answer')
         )
 
+        # Create an initial summary of symptom details.
+        initial_summary_text = (
+            f"- Main Complaint: {symptom_summary.get('key_symptom', 'Not specified')}\n"
+            f"- Initial Severity: {symptom_summary.get('severity', 'Not specified')}\n"
+            f"- Initial Onset/Duration: {symptom_summary.get('onset_duration', 'Not specified')}\n"
+            f"- Initial Location: {symptom_summary.get('location', 'Not specified')}\n"
+            f"- Initial Character: {symptom_summary.get('character', 'Not specified')}\n"
+            f"- Initial Associated Symptoms: {symptom_summary.get('associated_symptoms', 'Not specified')}"
+        )
+
+        # Build detailed context including transcript and follow-up Q&A.
         detailed_context = (
-            "Conversation so far:\n"
-            f"Patient's description: {reviewed_transcript}\n"
-            f"Key symptom: {key_symptom}\n"
-            "Static Follow-up Q&A:\n" + (static_followup_text or "None") + "\n"
-            "Dynamic Follow-up Q&A:\n" + (dynamic_followup_text or "None") + "\n"
+            "Conversation Summary:\n"
+            "Patient's Initial Statement Analysis:\n" + initial_summary_text + "\n"
+            f"(Full Transcript: \"{reviewed_transcript}\")\n\n"
+            "Static Follow-up Q&A:\n" + (static_followup_text if static_followup_text else "None provided.\n") + "\n"
+            "Dynamic Follow-up Q&A:\n" + (dynamic_followup_text if dynamic_followup_text else "None provided.\n")
         )
 
+        # Build the full prompt for the LLM.
         prompt = (
-            "You are a compassionate doctor speaking directly to a patient with limited medical knowledge. "
-            "Based solely on the conversation below, create a concise, personalized home care plan in one paragraph of approximately 150 words. "
-            "Focus on practical, specific home care strategies the patient can follow to find relief from the key symptom, "
-            "integrating insights from both the static and dynamic follow-up Q&A without repeating the questions or answers verbatim. "
-            "Address the symptom’s severity, triggers, daily impact, or associated symptoms as relevant, ensuring all advice is tailored to the patient’s responses. "
-            "Use clear, simple language, avoid medical jargon, and make the tone encouraging and supportive. "
-            "Do not include section headings, bolded text, or numbered lists—just a single, flowing paragraph.\n\n"
-            f"{detailed_context}\n\n"
-            "Your Personalized Home Care Plan:" # Removed extra newline
+            "You are a caring physician summarizing home care advice for a patient after a consultation.\n"
+            "Based specifically on the conversation summary below (including initial analysis and follow-up answers), "
+            "create a concise, personalized home care plan. The plan should focus on practical strategies for managing the "
+            f"patient's condition, primarily related to '{key_symptom}'. Use simple, supportive, and empathetic language "
+            "directly addressing the patient.\n\n"
+            "Present the advice as a single, flowing paragraph of text (around 100-150 words). "
+            "DO NOT use any lists, bullet points, numbering, or bold text in your final output; just provide plain paragraph text.\n\n"
+            "Tailor the advice by considering all provided details, including:\n"
+            "- General advice (e.g., rest, hydration).\n"
+            "- Specific non-pharmacological suggestions relevant to the symptoms and follow-up details.\n"
+            "- Mention of over-the-counter (OTC) options if appropriate based on the full context.\n"
+            "- Activities to potentially avoid or modify based on triggers or patient responses.\n"
+            "- Clear red flag conditions under which the patient should seek further medical attention.\n\n"
+            "### Conversation Summary:\n" + detailed_context + "\n"
+            "### Your Personalized Home Care Plan (Single Paragraph, Plain Text):"
         )
 
-        result = self.generate_text(
-            prompt,
-            max_new_tokens=250, # Increased slightly for potentially longer advice
-            num_beams=5,
-            temperature=0.6, # Adjusted temp slightly
-            repetition_penalty=1.1, # Adjusted penalty slightly
-            early_stopping=True
+        try:
+            # Generate the home care plan using the LLM.
+            result = self.generate_text(
+                prompt,
+                max_new_tokens=250,
+                num_beams=3,
+                temperature=0.6,
+                repetition_penalty=1.15
+            )
+        except Exception as e:
+            logger.error(f"Error during LLM guideline generation: {e}", exc_info=True)
+            result = ""
+
+        # Fallback guideline in case of error or empty result.
+        fallback_guideline = (
+            f"Based on our discussion regarding your {key_symptom}, please ensure you get plenty of rest and maintain proper hydration. "
+            "If you experience any worsening of symptoms or notice new concerning signs, consider over-the-counter remedies as appropriate and avoid activities that trigger discomfort. "
+            "Should your condition not improve or if you experience significant changes, please seek prompt medical advice."
         )
 
-        # Check if generation failed
-        if result.startswith("Error:"):
-            logger.error(f"Failed to generate guidelines: {result}")
-            return f"I apologize, but I encountered an issue generating personalized guidelines based on our conversation. Please consult with a healthcare professional for advice regarding your {key_symptom}."
+        disclaimer = "\n\n*Disclaimer: This is general automated advice based on the conversation. Consult a healthcare professional for diagnosis and treatment.*"
 
+        if result.startswith("Error:") or not result.strip():
+            logger.warning(f"LLM guideline generation failed or returned empty. Using fallback for key_symptom: {key_symptom}")
+            final_guidelines = fallback_guideline
+        else:
+            final_guidelines = result.strip()
 
-        # --- Post-processing the guidelines ---
-        # Remove potential leading labels or markers
-        paragraph = " ".join(result.split()) # Consolidate whitespace
+        # Clean up the generated output: remove any unintended formatting.
+        final_guidelines = re.sub(r"^\s*(\d+\.|\*|-)\s*", "", final_guidelines, flags=re.MULTILINE)
+        final_guidelines = re.sub(r"\*\*(.*?)\*\*", r"\1", final_guidelines)
+        final_guidelines = re.sub(r"\s+", " ", final_guidelines).strip()
 
-        # Remove common model artifacts or formatting intrusions
-        paragraph = re.sub(r"^\d+\.\s+", "", paragraph) # Leading numbers
-        paragraph = re.sub(r"(\s)\d+\.\s+", r"\1", paragraph) # Mid-text numbers
-        paragraph = re.sub(r"\*\*.*?\*\*\s*[:\-]?\s*", "", paragraph) # Bolded labels like **Advice:**
-        paragraph = re.sub(r"\[.*?\]\s*", "", paragraph) # Content in square brackets
-        paragraph = paragraph.replace("Home Care Plan:", "").strip() # Remove explicit label if present
+        # Ensure the result appears like home care advice.
+        if not any(phrase in final_guidelines.lower() for phrase in ["based on", "for your", "try", "you should", "it's important", "please focus"]):
+            final_guidelines = f"For your {key_symptom}, here are some home care suggestions: " + final_guidelines
 
-        # Target word count (approximate) - This logic is flawed, just return the cleaned paragraph
-        # Trying to force a word count often makes the text unnatural. Let the model control the length primarily.
-        # words = paragraph.split()
-        # target_words = 150
-        # if len(words) < target_words * 0.8: # If significantly shorter
-        #     logger.warning(f"Generated guidelines shorter than expected ({len(words)} words).")
-        # elif len(words) > target_words * 1.2: # If significantly longer
-        #     logger.warning(f"Generated guidelines longer than expected ({len(words)} words). Truncating.")
-        #     words = words[:int(target_words*1.1)] # Truncate with some buffer
-
-        # final_paragraph = " ".join(words)
-
-        final_paragraph = paragraph # Use the cleaned paragraph directly
-
-        # Ensure proper sentence ending
-        if final_paragraph and final_paragraph[-1].isalnum():
-            final_paragraph += "."
-
-        return final_paragraph
+        return final_guidelines + disclaimer
 
 llm_handler = LLMHandler()
-
-# --- Flask Routes (Keep as is, but add error handling for LLM calls) ---
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
     if "file" not in request.files:
-        return jsonify({"error": "No file uploaded. Please upload an audio file with key 'file'."}), 400
+        return jsonify({"error": "No file uploaded."}), 400
 
     audio_file = request.files["file"]
-    # Use a temporary directory to handle potential file naming issues
     with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = os.path.join(temp_dir, "audio.wav") # Give it a specific name/extension
+        temp_path = os.path.join(temp_dir, "audio.wav")
         try:
-             audio_file.save(temp_path)
-        except Exception as save_err:
-             logger.error(f"Error saving uploaded file: {save_err}", exc_info=True)
-             return jsonify({"error": f"Failed to save uploaded file: {save_err}"}), 500
-
-        whisper_model = None # Initialize
-        try:
-             # Load model within the request if memory is a concern, or preload if frequently used
-             whisper_model = whisper.load_model("small.en", device=DEVICE)
-             logger.info("Whisper model loaded.")
-             result = whisper_model.transcribe(temp_path, fp16=False) # fp16=False is safer for CPU
-             logger.info(f"Raw transcription result: {result}")
+            audio_file.save(temp_path)
         except Exception as e:
-             logger.error("Transcription failed", exc_info=True)
-             # Check for common errors like ffmpeg not found
-             if "ffmpeg" in str(e).lower():
-                  return jsonify({"error": "Transcription failed: ffmpeg not found or not configured correctly."}), 500
-             return jsonify({"error": f"Transcription failed: {str(e)}"}), 500
+            logger.error(f"Error saving file: {e}", exc_info=True)
+            return jsonify({"error": f"Failed to save file: {e}"}), 500
+
+        whisper_model = None
+        try:
+            # Offload Whisper tasks to a thread pool
+            with executor as pool:
+                whisper_model = pool.submit(whisper.load_model, "small.en", device=DEVICE).result()
+                result = pool.submit(whisper_model.transcribe, temp_path, fp16=False).result()
+        except Exception as e:
+            logger.error("Transcription failed", exc_info=True)
+            return jsonify({"error": f"Transcription failed: {str(e)}"}), 500
         finally:
-             # Ensure model is unloaded to free memory
-             if whisper_model is not None:
-                 del whisper_model
-                 if DEVICE == 'cuda':
-                      torch.cuda.empty_cache() # Clear GPU cache if CUDA was used
-                 gc.collect()
-                 logger.info("Whisper model unloaded and garbage collected.")
+            if whisper_model is not None:
+                del whisper_model
+                if DEVICE == "cuda":
+                    torch.cuda.empty_cache()
+                gc.collect()
 
-
-    transcript_raw = result.get("text", "")
-    # More robust cleaning
-    transcript = transcript_raw if isinstance(transcript_raw, str) else " ".join(map(str, transcript_raw))
-    transcript = re.sub(r'\s+', ' ', transcript).strip() # Consolidate whitespace
-    # Keep basic punctuation useful for context
-    transcript = re.sub(r'[^\w\s.,!?-]', '', transcript) # Allow basic punctuation
-
-    logger.info(f"Processed transcript: '{transcript}'")
+    transcript = re.sub(r'\s+', ' ', result.get("text", "").strip())
     if not transcript:
-        # Provide more context if possible (e.g., empty result vs. error)
-        if "text" not in result or not result["text"]:
-            return jsonify({"error": "Transcription resulted in empty text. Please ensure the audio is clear and contains speech."}), 500
-        else:
-             return jsonify({"error": "Transcript processing failed. Check logs."}), 500
-
+        return jsonify({"error": "Transcription resulted in empty text."}), 500
     return jsonify({"transcript": transcript})
 
-@app.route("/extract_symptoms", methods=["POST"])
-def extract_symptoms():
+# --- In your Flask app (server.py) ---
+
+# Remove the old '/extract_symptoms' and replace with this:
+@app.route("/extract_symptom_summary", methods=["POST"])
+def extract_symptom_summary_endpoint():
     data = request.get_json()
     if not data or "transcript" not in data:
-        return jsonify({"error": "No transcript provided. Please provide a transcript in the request body."}), 400
+        return jsonify({"error": "No transcript provided."}), 400
 
     transcript = data["transcript"].strip()
     if not transcript:
-        return jsonify({"error": "The provided transcript is empty."}), 400
+         return jsonify({"error": "Empty transcript provided."}), 400
 
     try:
-        # Define the prompt clearly
-        prompt = (
-             "You are a medical assistant analyzing a patient's statement. "
-             "Based on the following patient description, identify and extract only the single most prominent key symptom or complaint. "
-             "Express this symptom concisely in one or a few words (e.g., 'headache', 'stomach pain', 'difficulty breathing'). "
-             "Do not add any explanation or introductory phrases.\n\n"
-             f"Patient Description: \"{transcript}\"\n\n"
-             "Key Symptom:" # Changed from "Answer:" for clarity
-        )
-        key_symptom_raw = llm_handler.generate_text(
-            prompt,
-            max_new_tokens=15, # Reduced max tokens
-            num_beams=3,
-            temperature=0.5, # Lower temp for focused extraction
-            repetition_penalty=1.1
-        )
-
-        # Check if generation failed
-        if key_symptom_raw.startswith("Error:"):
-            logger.error(f"Key symptom extraction failed: {key_symptom_raw}")
-            return jsonify({"error": f"Key symptom extraction failed due to LLM error: {key_symptom_raw}"}), 500
-
-        # Post-process the result more carefully
-        # Remove potential prefixes or instructions the model might have repeated
-        key_symptom = key_symptom_raw.replace("Key Symptom:", "").strip()
-        # Remove punctuation that might trail
-        key_symptom = re.sub(r'[.,!?]$', '', key_symptom).strip()
-        # Optional: Convert to lower case for consistency? Depends on downstream use.
-        # key_symptom = key_symptom.lower()
-
-        if not key_symptom:
-            logger.warning(f"LLM returned empty result for key symptom extraction from transcript: {transcript}")
-            # Fallback or specific error
-            return jsonify({"error": "Could not extract a key symptom from the provided transcript."}), 500
-
+        # Use the new method in LLMHandler
+        # Consider running this in the executor if it becomes slow
+        summary = llm_handler.extract_structured_symptoms(transcript)
+        return jsonify({"symptom_summary": summary})
     except Exception as e:
-        # Catch potential errors during the generate_text call itself if not handled inside
-        logger.error("Key symptom extraction error (outer)", exc_info=True)
-        return jsonify({"error": f"An unexpected error occurred during key symptom extraction: {str(e)}"}), 500
+        logger.error("Error during symptom summary extraction", exc_info=True)
+        return jsonify({"error": f"Failed to extract symptom summary: {str(e)}"}), 500
 
-    logger.info(f"Extracted key symptom: '{key_symptom}'")
-    return jsonify({"key_symptom": key_symptom})
+# --- In your Flask app (server.py) ---
 
-
+# Modify the '/generate_followup_questions' endpoint
 @app.route("/generate_followup_questions", methods=["POST"])
 def generate_followup_questions_endpoint():
     data = request.get_json()
-    # Validate input structure more carefully
     if not data or not isinstance(data, dict):
-         return jsonify({"error": "Invalid request body. JSON object expected."}), 400
+        return jsonify({"error": "Invalid request body."}), 400
 
     reviewed_transcript = data.get("reviewed_transcript", "").strip()
-    key_symptom = data.get("key_symptom", "").strip()
-    static_followup = data.get("static_followup", []) # Assume it's a list
+    # --- **MODIFIED**: Expect symptom_summary dictionary ---
+    symptom_summary = data.get("symptom_summary") # Expect the dict now
+    static_followup = data.get("static_followup", [])
 
-    # Check required fields
-    if not reviewed_transcript or not key_symptom:
-        return jsonify({"error": "Missing required fields. Please provide non-empty 'reviewed_transcript' and 'key_symptom'."}), 400
-
-    # Validate static_followup format (optional but good practice)
-    if not isinstance(static_followup, list):
-        return jsonify({"error": "'static_followup' must be a list of objects (can be empty)."}), 400
-    # Further validation can check if list items are dicts with 'question'/'answer'
+    # --- **MODIFIED**: Validate symptom_summary ---
+    if not reviewed_transcript or not symptom_summary or not isinstance(symptom_summary, dict):
+        # Ensure key_symptom exists within the summary for basic operation
+        if not symptom_summary or not symptom_summary.get("key_symptom"):
+             return jsonify({"error": "Missing required fields: reviewed_transcript or valid symptom_summary."}), 400
 
     try:
-        questions = llm_handler.generate_followup_questions(reviewed_transcript, key_symptom, static_followup)
-        # The function now handles LLM errors internally and returns defaults/empty list
-        if not questions:
-            # This case might occur if even default questions were deemed redundant
-            logger.warning("No follow-up questions generated, possibly due to redundancy or errors.")
-            # Return empty list or a message
-            return jsonify({"follow_up_questions": [], "message": "No suitable follow-up questions could be generated."})
-
+        # --- **MODIFIED**: Pass symptom_summary to the handler ---
+        questions = llm_handler.generate_followup_questions(reviewed_transcript, symptom_summary, static_followup)
+        return jsonify({"follow_up_questions": questions})
     except Exception as e:
-        # Catch unexpected errors in the endpoint logic itself
-        logger.error("Error in /generate_followup_questions endpoint", exc_info=True)
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+        logger.error("Error in follow-up questions", exc_info=True)
+        return jsonify({"error": f"Error generating follow-up questions: {str(e)}"}), 500
 
-    return jsonify({"follow_up_questions": questions})
+# --- In your Flask app (server.py) ---
 
-
+# Modify the '/generate_guidelines' endpoint
 @app.route("/generate_guidelines", methods=["POST"])
-def generate_guidelines_endpoint(): # Renamed function for clarity
+def generate_guidelines_endpoint():
     data = request.get_json()
-    # Validate input
     if not data or not isinstance(data, dict):
-         return jsonify({"error": "Invalid request body. JSON object expected."}), 400
+        return jsonify({"error": "Invalid request body."}), 400
 
-    transcript = data.get("transcript", "").strip()
-    key_symptom = data.get("key_symptom", "").strip()
-    static_followup = data.get("static_followup", []) # Renamed for clarity internally
+    # --- **MODIFIED**: Expect transcript AND symptom_summary ---
+    # Keep transcript for the full context if needed by handler
+    transcript = data.get("transcript", "").strip() # Keep original transcript
+    symptom_summary = data.get("symptom_summary") # Expect the dict
+    static_followup = data.get("static_followup", [])
     dynamic_followup = data.get("dynamic_followup", [])
 
-    if not transcript or not key_symptom:
-        return jsonify({"error": "Transcript and key_symptom cannot be empty."}), 400
+    # --- **MODIFIED**: Validate symptom_summary ---
+    if not transcript or not symptom_summary or not isinstance(symptom_summary, dict):
+         # Ensure key_symptom exists within the summary for basic operation
+         if not symptom_summary or not symptom_summary.get("key_symptom"):
+             return jsonify({"error": "Transcript and valid symptom_summary required."}), 400
 
-    # Validate that follow-ups are lists (basic check)
-    if not isinstance(static_followup, list) or not isinstance(dynamic_followup, list):
-         return jsonify({"error": "Follow-up data must be provided as lists."}), 400
+    # --- **MODIFIED**: Pass symptom_summary to the handler ---
+    # Offload LLM generation to a thread pool (keep this)
+    with executor as pool:
+        future = pool.submit(
+            llm_handler.generate_guidelines, transcript, symptom_summary, static_followup, dynamic_followup
+        )
+        guidelines_text = future.result() # Add timeout?
 
+    if not guidelines_text or guidelines_text.startswith("Error:"): # Check for errors here too
+        # Attempt to provide a basic fallback even if generation failed
+        key_symptom = symptom_summary.get("key_symptom", "your symptom")
+        guidelines_text = (
+             f"For your {key_symptom}, focus on getting adequate rest and staying hydrated. "
+             "Monitor your symptoms closely. If they worsen or don't improve, please seek medical attention."
+             "\n\n*Disclaimer: This is general automated advice. Consult a healthcare professional for diagnosis and treatment.*"
+        )
+        # Don't return 500, provide the fallback text
+        # return jsonify({"error": "Failed to generate guidelines."}), 500
 
-    # Check if answers are provided (crucial for guideline generation)
-    # Allow empty answers but log a warning, as the LLM might struggle
-    missing_static_answers = any(not item.get("answer", "").strip() for item in static_followup if isinstance(item, dict))
-    missing_dynamic_answers = any(not item.get("answer", "").strip() for item in dynamic_followup if isinstance(item, dict))
-
-    if missing_static_answers:
-        logger.warning("Some static follow-up questions might be unanswered. Guidelines might be less specific.")
-        # Decide if this should be a hard error or just a warning
-        # return jsonify({"error": "All static follow-up questions must be answered for guideline generation."}), 400
-    if missing_dynamic_answers:
-        logger.warning("Some dynamic follow-up questions might be unanswered. Guidelines might be less specific.")
-        # return jsonify({"error": "All dynamic follow-up questions must be answered for guideline generation."}), 400
-
-    # Load model if needed (handled within generate_guidelines now)
-    # llm_handler.load_model() # Removed, called inside generate_guidelines
-
-    guidelines_text = "" # Initialize
+    # --- Text-to-Speech (Keep this logic) ---
+    audio_data = ""
     try:
-        guidelines_text = llm_handler.generate_guidelines(transcript, key_symptom, static_followup, dynamic_followup)
-        # Check if generation failed (function returns error string now)
-        if guidelines_text.startswith("Error:") or guidelines_text.startswith("I apologize, but"):
-             logger.error(f"Guideline generation failed: {guidelines_text}")
-             # Return the error message from the LLM or a generic one
-             return jsonify({"error": guidelines_text}), 500
-
-        logger.info(f"Generated guidelines: '{guidelines_text}'")
-
+        # Remove disclaimer for TTS if desired
+        text_for_tts = guidelines_text.split("*Disclaimer:")[0].strip()
+        if text_for_tts:
+             tts = gTTS(text=text_for_tts, lang='en', slow=False)
+             audio_io = io.BytesIO()
+             tts.write_to_fp(audio_io)
+             audio_io.seek(0)
+             audio_base64 = base64.b64encode(audio_io.read()).decode('utf-8')
+             audio_data = f"data:audio/mp3;base64,{audio_base64}"
     except Exception as e:
-         # Catch unexpected errors in the endpoint logic
-         logger.error("Error in /generate_guidelines endpoint during LLM call", exc_info=True)
-         return jsonify({"error": f"An unexpected error occurred during guideline generation: {str(e)}"}), 500
-
-
-    # --- TTS Generation ---
-    audio_data = "" # Initialize
-    if guidelines_text: # Only attempt TTS if guidelines were successfully generated
-        try:
-            tts = gTTS(text=guidelines_text, lang='en', slow=False) # Consider slow=False for natural speed
-            audio_io = io.BytesIO()
-            tts.write_to_fp(audio_io)
-            audio_io.seek(0)
-            audio_base64 = base64.b64encode(audio_io.read()).decode('utf-8')
-            audio_data = f"data:audio/mp3;base64,{audio_base64}"
-            logger.info("TTS audio generated successfully.")
-        except Exception as e:
-            logger.error("TTS conversion error", exc_info=True)
-            # Don't fail the whole request, just return guidelines without audio
-            # audio_data will remain ""
+        logger.error("TTS error", exc_info=True)
+        # Proceed without audio if TTS fails
 
     return jsonify({"guidelines": guidelines_text, "audio_data": audio_data})
 
 
 if __name__ == "__main__":
-    # Set up Ngrok tunnel
+    print("Preloading LLM model...")
+    try:
+        llm_handler.load_model()
+    except Exception as e:
+        print(f"Failed to preload model: {e}. Falling back to on-demand loading.")
+
     public_url = None
     try:
-        # Ensure Ngrok is shutdown if script restarts uncleanly
         ngrok.kill()
-        public_url = ngrok.connect("5000") # Use port 5000
+        public_url = ngrok.connect("5000")
         print(f"Ngrok Tunnel active at: {public_url}")
-    except Exception as ngrok_error:
-        print(f"Failed to start Ngrok tunnel: {ngrok_error}")
-        # Decide if you want to exit or run locally only
-        # exit() # Or just print warning and continue locally
+    except Exception as e:
+        print(f"Failed to start Ngrok tunnel: {e}")
 
-    # Run Flask app
-    # Use waitress or gunicorn for production instead of Flask's development server
-    print("Starting Flask development server on http://0.0.0.0:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False) # debug=False is important for production/stability
-
-    # Optional: Disconnect ngrok on clean exit (might not run if CTRL+C is too abrupt)
-    # finally:
-    #     if public_url:
-    #          print("Disconnecting Ngrok tunnel...")
-    #          ngrok.disconnect(public_url)
+    print("Starting Flask server on http://0.0.0.0:5000")
+    try:
+        app.run(host="0.0.0.0", port=5000, debug=False)
+    finally:
+        executor.shutdown(wait=True)  # Clean up thread pool on exit
