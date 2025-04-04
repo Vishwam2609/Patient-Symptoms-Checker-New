@@ -210,10 +210,10 @@ class LLMHandler:
 
         except (json.JSONDecodeError, ValueError) as e:
             logger.error(f"LLM output parsing/validation error: {e}. Raw output: '{raw_output}'")
-            
+
             # Fallback: Use regex-based extraction for each field.
             transcript_lower = transcript.lower()
-            
+
             # Broader symptom detection with a regex pattern.
             # Using re.findall to capture all occurrences so that we can select the most relevant one.
             symptom_pattern = r"\b(fever|headache|cough|coughing|pain|ache|sore|nausea|dizziness|fatigue|shortness of breath|vomiting|diarrhea|rash|chills|congestion|swelling|itching|bleeding|weakness)\b"
@@ -446,31 +446,31 @@ class LLMHandler:
 
     # --- Final generate_guidelines function ---
     # Replace the old generate_guidelines method
-    def generate_guidelines(self, reviewed_transcript: str, symptom_summary: dict, static_followup: list, dynamic_followup: list) -> str:
+    def generate_guidelines(self, reviewed_transcript: str, symptom_summary: dict, static_followup: list, dynamic_followup: list) -> dict:
         """
-        Generates a personalized home care plan based on the patient's conversation and symptom analysis.
-        
+        Generates a personalized home care plan and a concise summary based on the patient's conversation and symptom analysis.
+
         This function builds a detailed prompt from:
           - The structured symptom summary.
           - The full reviewed transcript.
           - Static and dynamic follow-up Q&A.
-        
+
         The LLM is then used to generate a single, flowing paragraph (approximately 100-150 words) with plain text advice.
-        The advice includes general care recommendations, specific non-pharmacological suggestions, possible OTC options, 
+        The advice includes general care recommendations, specific non-pharmacological suggestions, possible OTC options,
         modifications to activities, and red flag conditions that would require further medical evaluation.
-        
-        A standard disclaimer is appended to the result. If the LLM fails or returns an empty result, a fallback guideline 
+
+        A standard disclaimer is appended to the result. If the LLM fails or returns an empty result, a fallback guideline
         is used based on the primary symptom.
-        
+
         Args:
             reviewed_transcript (str): The full transcript of the patient consultation.
-            symptom_summary (dict): A dictionary with keys such as 'key_symptom', 'severity', 'onset_duration', 'location', 
+            symptom_summary (dict): A dictionary with keys such as 'key_symptom', 'severity', 'onset_duration', 'location',
                                     'character', and 'associated_symptoms'.
             static_followup (list): A list of dictionaries for static follow-up Q&A.
             dynamic_followup (list): A list of dictionaries for dynamic follow-up Q&A.
-        
+
         Returns:
-            str: A single paragraph of personalized home care advice with an appended disclaimer.
+            dict: A single paragraph of personalized home care advice with an appended disclaimer and 'summary' (concise 2-3 line overview).
         """
         # Retrieve key symptom from summary, with a fallback label.
         key_symptom = symptom_summary.get('key_symptom', 'the symptom')
@@ -562,7 +562,30 @@ class LLMHandler:
         if not any(phrase in final_guidelines.lower() for phrase in ["based on", "for your", "try", "you should", "it's important", "please focus"]):
             final_guidelines = f"For your {key_symptom}, here are some home care suggestions: " + final_guidelines
 
-        return final_guidelines + disclaimer
+        # Generate concise summary from the guidelines (before adding disclaimer)
+        summary_text = self.generate_summary(final_guidelines)
+
+        # Return both guidelines (with disclaimer) and summary
+        return {"guidelines": final_guidelines + disclaimer, "summary": summary_text}
+
+    def generate_summary(self, guidelines_text: str) -> str:
+        """
+        Generates a concise 2-3 line summary of the provided guidelines, focusing on key points and overall advice.
+        """
+        prompt = (
+            "Based on the following home care guidelines, provide a very concise summary (2-3 lines) that highlights the key points and overall advice. "
+            "Ensure the summary is clear, patient-friendly, and directly addresses the patient.\n\n"
+            f"Guidelines:\n{guidelines_text}\n\n"
+            "Concise Summary:"
+        )
+        summary = self.generate_text(
+            prompt,
+            max_new_tokens=100,  # Limits length to ensure conciseness (approx. 60-80 words for 2-3 lines)
+            num_beams=3,
+            temperature=0.5,     # Lower temperature for focused, clear output
+            repetition_penalty=1.2
+        )
+        return summary.strip()
 
 llm_handler = LLMHandler()
 
@@ -675,11 +698,14 @@ def generate_guidelines_endpoint():
 
     # --- **MODIFIED**: Pass symptom_summary to the handler ---
     # Offload LLM generation to a thread pool (keep this)
+    # Generate guidelines and summary
     with executor as pool:
         future = pool.submit(
             llm_handler.generate_guidelines, transcript, symptom_summary, static_followup, dynamic_followup
         )
-        guidelines_text = future.result() # Add timeout?
+        result = future.result()
+        guidelines_text = result["guidelines"]
+        summary_text = result["summary"]
 
     if not guidelines_text or guidelines_text.startswith("Error:"): # Check for errors here too
         # Attempt to provide a basic fallback even if generation failed
@@ -693,22 +719,21 @@ def generate_guidelines_endpoint():
         # return jsonify({"error": "Failed to generate guidelines."}), 500
 
     # --- Text-to-Speech (Keep this logic) ---
+    # Use summary for TTS
     audio_data = ""
     try:
-        # Remove disclaimer for TTS if desired
-        text_for_tts = guidelines_text.split("*Disclaimer:")[0].strip()
-        if text_for_tts:
-             tts = gTTS(text=text_for_tts, lang='en', slow=False)
-             audio_io = io.BytesIO()
-             tts.write_to_fp(audio_io)
-             audio_io.seek(0)
-             audio_base64 = base64.b64encode(audio_io.read()).decode('utf-8')
-             audio_data = f"data:audio/mp3;base64,{audio_base64}"
+        if summary_text:
+            tts = gTTS(text=summary_text, lang='en', slow=False)
+            audio_io = io.BytesIO()
+            tts.write_to_fp(audio_io)
+            audio_io.seek(0)
+            audio_base64 = base64.b64encode(audio_io.read()).decode('utf-8')
+            audio_data = f"data:audio/mp3;base64,{audio_base64}"
     except Exception as e:
         logger.error("TTS error", exc_info=True)
-        # Proceed without audio if TTS fails
 
-    return jsonify({"guidelines": guidelines_text, "audio_data": audio_data})
+    # Return summary, guidelines, and audio data
+    return jsonify({"summary": summary_text, "guidelines": guidelines_text, "audio_data": audio_data})
 
 
 if __name__ == "__main__":

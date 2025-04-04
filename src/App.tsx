@@ -4,7 +4,7 @@ import { Mic, Loader2, User } from 'lucide-react';
 import './styles.css';
 
 // Adjust the API_BASE_URL to match your server endpoint
-const API_BASE_URL = 'https://5f54-35-198-212-87.ngrok-free.app/';
+const API_BASE_URL = 'https://0143-34-142-172-132.ngrok-free.app/';
 
 // Define application steps
 type AppStep =
@@ -241,6 +241,7 @@ const App: React.FC = () => {
   const isLoadingDynamicRef = useRef<boolean>(false);
   const conversationEndRef = useRef<HTMLDivElement>(null);
   const waitingIntervalRef = useRef<number | null>(null);
+  const [summary, setSummary] = useState<string>(''); // New state variable
 
   const { voiceInput } = useVoiceInput(
     (msg: Message) => addMessage(msg),
@@ -524,11 +525,12 @@ const App: React.FC = () => {
           return res.json();
         })
         .then(data => {
-          if (data.guidelines) {
+          if (data.summary && data.guidelines) {
+            setSummary(data.summary);
             setGuidelines(data.guidelines);
             if (data.audio_data) setAudioSrc(data.audio_data);
-            speak(`Here’s your personalized care plan to help you feel better: ${data.guidelines}. If you need anything else, don’t hesitate to reach out.`);
-            addMessage({ sender: 'doctor', text: `Here’s your personalized care plan to help you feel better: ${data.guidelines}. If you need anything else, don’t hesitate to reach out.`, timestamp: new Date() });
+            speak(`Here’s a quick summary of your care plan: ${data.summary}. For more details, check the full plan. If you need anything else, don’t hesitate to reach out.`);
+            addMessage({ sender: 'doctor', text: `Here’s a quick summary of your care plan: ${data.summary}. For more details, check the full plan. If you need anything else, don’t hesitate to reach out.`, timestamp: new Date() });
           }
         })
         .catch(() => {
@@ -553,6 +555,7 @@ const App: React.FC = () => {
     setCurrentStaticIndex(0);
     setCurrentDynamicIndex(0);
     setGuidelines('');
+    setSummary(''); // Added to clear summary
     setAudioSrc('');
     setConversation([]);
     setOverlayVisible(true);
@@ -663,13 +666,22 @@ const App: React.FC = () => {
         {step === 'final' && !loading && guidelines && (
           <div className="w-full p-8 bg-white shadow-xl rounded-2xl animate-slide-up">
             <h2 className="mb-6 text-3xl font-bold text-center text-teal-700">Your Personalized Care Plan</h2>
-            <p className="text-lg leading-relaxed text-gray-700">{guidelines}</p>
-            {audioSrc && (
-              <audio controls className="w-full mt-4">
-                <source src={audioSrc} type="audio/mp3" />
-                Your browser does not support the audio element.
-              </audio>
+            {summary && (
+              <div className="mb-6">
+                <h3 className="text-2xl font-semibold text-teal-600">Summary</h3>
+                <p className="text-lg leading-relaxed text-gray-700">{summary}</p>
+                {audioSrc && (
+                  <audio controls className="w-full mt-4">
+                    <source src={audioSrc} type="audio/mp3" />
+                    Your browser does not support the audio element.
+                  </audio>
+                )}
+              </div>
             )}
+            <div>
+              <h3 className="text-2xl font-semibold text-teal-600">Detailed Guidelines</h3>
+              <p className="text-lg leading-relaxed text-gray-700">{guidelines}</p>
+            </div>
           </div>
         )}
 
