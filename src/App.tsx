@@ -4,7 +4,7 @@ import { Mic, Loader2, User } from 'lucide-react';
 import './styles.css';
 
 // Adjust the API_BASE_URL to match your server endpoint
-const API_BASE_URL = 'https://0143-34-142-172-132.ngrok-free.app/';
+const API_BASE_URL = 'https://0881-34-142-199-38.ngrok-free.app/';
 
 // Define application steps
 type AppStep =
@@ -34,7 +34,7 @@ interface SymptomSummary {
   associated_symptoms: string;
 }
 
-/** Utility to speak text, canceling any ongoing speech */
+/** Utility to speak text */
 function speak(text: string) {
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
@@ -43,14 +43,13 @@ function speak(text: string) {
   window.speechSynthesis.speak(utterance);
 }
 
-/** Starts browser-based speech recognition with silence detection */
+/** Starts speech recognition with silence detection */
 const startSpeechRecognition = (
   onResult: (transcript: string) => void,
   onError: (err: any) => void,
   toggleMic?: (active: boolean) => void
 ) => {
-  const SpeechRecognition =
-    (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+  const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
   if (!SpeechRecognition) {
     onError("Speech recognition not supported. Please type your response below.");
     return null;
@@ -63,7 +62,7 @@ const startSpeechRecognition = (
 
   let finalTranscript = '';
   let silenceTimeout: NodeJS.Timeout | null = null;
-  const SILENCE_THRESHOLD = 1000; // 1 second of silence
+  const SILENCE_THRESHOLD = 1000;
 
   recognition.onstart = () => toggleMic && toggleMic(true);
 
@@ -77,12 +76,9 @@ const startSpeechRecognition = (
         interimTranscript += result[0].transcript;
       }
     }
-
     if (interimTranscript || finalTranscript) {
       if (silenceTimeout) clearTimeout(silenceTimeout);
-      silenceTimeout = setTimeout(() => {
-        recognition.stop();
-      }, SILENCE_THRESHOLD);
+      silenceTimeout = setTimeout(() => recognition.stop(), SILENCE_THRESHOLD);
     }
   };
 
@@ -122,7 +118,7 @@ const speakAndListen = (
         addMessage({ sender: 'patient', text: result, timestamp: new Date() });
         onResult(result);
       },
-      (err) => onResult(""), // Pass empty string on error to trigger retry
+      (err) => onResult(""),
       toggleMic
     );
   };
@@ -140,13 +136,12 @@ const useVoiceInput = (
     async (promptMsg: string): Promise<string> => {
       let attempts = 0;
       const MAX_ATTEMPTS = 3;
-
       while (true) {
         try {
           const result: string = await new Promise((resolve) => {
             speakAndListen(promptMsg, resolve, addMessage, toggleMic, setCurrentPrompt);
           });
-          if (result) return result; // Return if valid response received
+          if (result) return result;
           throw new Error("No input detected");
         } catch (err) {
           attempts++;
@@ -158,14 +153,13 @@ const useVoiceInput = (
             const continueMsg = "I’m still having trouble hearing you. Let’s try one more time, or you can type if you prefer.";
             speak(continueMsg);
             addMessage({ sender: 'doctor', text: continueMsg, timestamp: new Date() });
-            attempts = 0; // Reset attempts
+            attempts = 0;
           }
         }
       }
     },
     [addMessage, toggleMic, setCurrentPrompt]
   );
-
   return { voiceInput };
 };
 
@@ -189,7 +183,7 @@ async function extractSymptoms(transcript: string, retries = 3): Promise<Symptom
   throw new Error("Unexpected error in extractSymptoms");
 }
 
-/** API function to generate follow-up questions based on full symptom summary */
+/** API function to generate follow-up questions */
 async function generateFollowupQuestions(
   reviewed_transcript: string,
   symptom_summary: SymptomSummary,
@@ -241,68 +235,56 @@ const App: React.FC = () => {
   const isLoadingDynamicRef = useRef<boolean>(false);
   const conversationEndRef = useRef<HTMLDivElement>(null);
   const waitingIntervalRef = useRef<number | null>(null);
-  const [summary, setSummary] = useState<string>(''); // New state variable
+  const [summary, setSummary] = useState<string>('');
+  const audioRef = useRef<HTMLAudioElement>(null);
 
-  const { voiceInput } = useVoiceInput(
-    (msg: Message) => addMessage(msg),
-    setMicActive,
-    setCurrentPrompt
-  );
+  const addMessage = (msg: Message) => setConversation((prev) => [...prev, msg]);
+  const { voiceInput } = useVoiceInput(addMessage, setMicActive, setCurrentPrompt);
 
-  // Auto-scroll to the latest conversation message
+  // Auto-scroll conversation
   useEffect(() => {
     conversationEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [conversation]);
 
-  const addMessage = (msg: Message) => setConversation((prev) => [...prev, msg]);
+  // Step indicator and progress percentage (memoized)
+  const stepIndicator = useMemo(() => {
+    switch (step) {
+      case 'initial': return 'Welcome to Your Health Journey';
+      case 'recording': return 'Step 1: Sharing How You Feel';
+      case 'review': return 'Step 2: Let’s Double-Check';
+      case 'followupLoading': return 'Step 3: Preparing Questions for You';
+      case 'followup': return 'Step 3: Learning More About You';
+      case 'dynamicFollowupLoading': return 'Step 4: Asking a Few More Things';
+      case 'dynamicFollowup': return 'Step 4: Getting to Know You Better';
+      case 'final': return 'Step 5: Your Personal Care Plan';
+      default: return '';
+    }
+  }, [step]);
 
-  // Memoized step indicator
-  const getStepIndicator = useMemo(
-    () => () => {
-      switch (step) {
-        case 'initial': return 'Welcome to Your Health Journey';
-        case 'recording': return 'Step 1: Sharing How You Feel';
-        case 'review': return 'Step 2: Let’s Double-Check';
-        case 'followupLoading': return 'Step 3: Preparing Questions for You';
-        case 'followup': return 'Step 3: Learning More About You';
-        case 'dynamicFollowupLoading': return 'Step 4: Asking a Few More Things';
-        case 'dynamicFollowup': return 'Step 4: Getting to Know You Better';
-        case 'final': return 'Step 5: Your Personal Care Plan';
-        default: return '';
-      }
-    },
-    [step]
-  );
+  const progressPercentage = useMemo(() => {
+    switch (step) {
+      case 'initial': return '0%';
+      case 'recording': return '20%';
+      case 'review': return '40%';
+      case 'followupLoading': return '50%';
+      case 'followup': return '60%';
+      case 'dynamicFollowupLoading': return '70%';
+      case 'dynamicFollowup': return '80%';
+      case 'final': return '100%';
+      default: return '0%';
+    }
+  }, [step]);
 
-  // Memoized progress percentage
-  const getProgressPercentage = useMemo(
-    () => () => {
-      switch (step) {
-        case 'initial': return '0%';
-        case 'recording': return '20%';
-        case 'review': return '40%';
-        case 'followupLoading': return '50%';
-        case 'followup': return '60%';
-        case 'dynamicFollowupLoading': return '70%';
-        case 'dynamicFollowup': return '80%';
-        case 'final': return '100%';
-        default: return '0%';
-      }
-    },
-    [step]
-  );
-
-  // Loading message based on step
   const getLoadingMessage = (): string => {
     switch (step) {
-      case 'followupLoading': return "We’re preparing some thoughtful questions to better understand how you’re doing.";
-      case 'dynamicFollowupLoading': return "Just a moment—we’re tailoring a few more questions specifically for you.";
-      case 'final': return "We’re putting together a care plan just for you to help you feel better soon.";
+      case 'followupLoading': return "We’re preparing some thoughtful questions for you.";
+      case 'dynamicFollowupLoading': return "Tailoring a few more questions specifically for you.";
+      case 'final': return "We’re putting together your care plan. Please hold on a moment.";
       default: return "We’re working on something special to support you...";
     }
   };
 
-  /** Handle waiting message during long loading periods */
+  // Waiting message for long loading periods (including final)
   useEffect(() => {
     if (loading && (step === 'followupLoading' || step === 'dynamicFollowupLoading' || step === 'final')) {
       waitingIntervalRef.current = window.setInterval(() => {
@@ -314,7 +296,6 @@ const App: React.FC = () => {
       clearInterval(waitingIntervalRef.current);
       waitingIntervalRef.current = null;
     }
-
     return () => {
       if (waitingIntervalRef.current) {
         clearInterval(waitingIntervalRef.current);
@@ -323,10 +304,10 @@ const App: React.FC = () => {
     };
   }, [loading, step]);
 
-  /** Handle overlay and welcome message */
+  // Handle overlay/welcome message
   const handleOverlayClick = () => {
     if (!welcomeSpoken) {
-      speak("Hello there! We’re so glad you’re here. Whenever you’re ready, just tell us how you’re feeling, and we’ll create a care plan tailored just for you. Tap 'Let’s Begin' when you’re ready to start.");
+      speak("Hello there! We’re so glad you’re here. Whenever you’re ready, tell us how you’re feeling and we’ll create a care plan just for you.");
       addMessage({ sender: 'doctor', text: "Hello there! We’re so glad you’re here...", timestamp: new Date() });
       setWelcomeSpoken(true);
     }
@@ -337,27 +318,27 @@ const App: React.FC = () => {
     setStep('recording');
     const result = await voiceInput("Whenever you’re ready, please tell me how you’re feeling today. What’s been going on?");
     setTranscript(result);
-    addMessage({ sender: 'doctor', text: "Thank you for sharing that with me. I’ve noted what you said. You’re doing great!", timestamp: new Date() });
+    addMessage({ sender: 'doctor', text: "Thank you for sharing. I’ve noted what you said.", timestamp: new Date() });
     setStep('review');
   };
 
-  /** Review Step: Confirm transcript */
+  /** Confirm transcript in review step */
   useEffect(() => {
     if (step === 'review' && !isConfirmingRef.current && !isManuallyPaused) {
       isConfirmingRef.current = true;
       (async () => {
         try {
-          const reviewMsg = `Here’s what I understood you said: "${transcript}". Does that sound right to you? Just say "yes" or "no."`;
+          const reviewMsg = `I heard: "${transcript}". Is that correct? Please say "yes" or "no."`;
           const result = await voiceInput(reviewMsg);
           if (result.toLowerCase().includes("yes")) {
-            speak("Great, I’m glad we’re on the same page. Let’s move forward.");
-            addMessage({ sender: 'doctor', text: "Great, I’m glad we’re on the same page. Let’s move forward.", timestamp: new Date() });
+            speak("Great! Let’s move forward.");
+            addMessage({ sender: 'doctor', text: "Great! Let’s move forward.", timestamp: new Date() });
             setStep('followupLoading');
           } else {
-            speak("No problem at all. Let’s try again. Can you tell me again how you’re feeling?");
-            addMessage({ sender: 'doctor', text: "No problem at all. Let’s try again. Can you tell me again how you’re feeling?", timestamp: new Date() });
+            speak("Okay, let’s try again. How are you feeling?");
+            addMessage({ sender: 'doctor', text: "Okay, let's try again. How are you feeling?", timestamp: new Date() });
             setStep('recording');
-            const retryResult = await voiceInput("Take your time and tell me again how you’re feeling.");
+            const retryResult = await voiceInput("Take your time and tell me how you’re feeling.");
             setTranscript(retryResult);
             setStep('review');
           }
@@ -368,43 +349,39 @@ const App: React.FC = () => {
     }
   }, [step, transcript, voiceInput, isManuallyPaused]);
 
-  /** Follow-Up Loading: Extract symptoms and prepare static questions */
+  /** Extract symptoms and set static questions */
   useEffect(() => {
     if (step === 'followupLoading' && !isManuallyPaused) {
       window.speechSynthesis.cancel();
-      speak("I’m just getting some questions ready to learn more about how you’re feeling. Bear with me for a moment.");
-      addMessage({ sender: 'doctor', text: "I’m just getting some questions ready to learn more about how you’re feeling. Bear with me for a moment.", timestamp: new Date() });
+      speak("Let me get some questions ready for you. Please hold on a moment.");
+      addMessage({ sender: 'doctor', text: "Let me get some questions ready for you. Please hold on a moment.", timestamp: new Date() });
       setLoading(true);
-
       (async () => {
         try {
           const summary = await extractSymptoms(transcript);
           setSymptomSummary(summary);
           const cleanedSymptom = summary.key_symptom.toLowerCase().trim().replace(/[^a-z]/g, "");
-
           const staticMapping: { [key: string]: string[] } = {
             fever: [
-              "Can you tell me when you first noticed the fever, and has it been constant or has it changed?",
-              "Are you experiencing any chills, sweating, or body aches along with the fever?",
-              "Have you recently been in a new place or around someone who was sick?"
+              "When did you first notice your fever and has it changed?",
+              "Are you experiencing chills or body aches along with the fever?",
+              "Have you recently been around someone who was sick?"
             ],
             coughing: [
-              "When did your cough start, and is it ongoing or does it come and go?",
-              "Is your cough dry, or are you coughing up mucus or anything else?",
-              "Are you having any trouble breathing, like feeling short of breath or tightness in your chest?"
+              "When did your cough start and is it continuous?",
+              "Is your cough dry, or are you coughing up mucus?",
+              "Are you having any trouble breathing or feeling short of breath?"
             ],
             headache: [
-              "When did your headache begin, and how severe or long-lasting is it?",
-              "Is the headache in one specific area, or does it cover your whole head?",
-              "Are you also feeling nauseous, sensitive to light or noise, or seeing anything unusual?"
+              "When did your headache begin and how severe is it?",
+              "Is the pain localized or spread out?",
+              "Do you feel nauseous or sensitive to light and sound?"
             ]
           };
-
           const possibleKeys = Object.keys(staticMapping);
           const foundKey = possibleKeys.find(
-            (key) => cleanedSymptom === key || cleanedSymptom.includes(key) || key.includes(cleanedSymptom)
+            key => cleanedSymptom === key || cleanedSymptom.includes(key) || key.includes(cleanedSymptom)
           );
-
           if (foundKey) {
             const questions = staticMapping[foundKey];
             setStaticFollowUpQuestions(questions);
@@ -415,8 +392,8 @@ const App: React.FC = () => {
             setStep('dynamicFollowupLoading');
           }
         } catch (error) {
-          setErrorMsg("I’m sorry, we had a little trouble understanding that. Could we start over?");
-          speak("I’m sorry, we had a little trouble understanding that. Could we start over?");
+          setErrorMsg("Sorry, we had trouble understanding. Could we start over?");
+          speak("Sorry, we had trouble understanding. Could we start over?");
           setStep('initial');
         }
         setLoading(false);
@@ -424,7 +401,7 @@ const App: React.FC = () => {
     }
   }, [step, transcript, isManuallyPaused]);
 
-  /** Static Follow-Up Questions */
+  /** Ask static follow-up questions */
   useEffect(() => {
     if (step === 'followup' && staticFollowUpQuestions.length > 0 && !isAskingStaticRef.current && !isManuallyPaused) {
       isAskingStaticRef.current = true;
@@ -435,12 +412,11 @@ const App: React.FC = () => {
           const newAnswers = [...staticFollowUpAnswers];
           newAnswers[currentStaticIndex] = result;
           setStaticFollowUpAnswers(newAnswers);
-
           if (currentStaticIndex + 1 < staticFollowUpQuestions.length) {
             setCurrentStaticIndex(currentStaticIndex + 1);
           } else {
-            speak("Thank you for those details. I’m going to ask a few more questions to get a clearer picture.");
-            addMessage({ sender: 'doctor', text: "Thank you for those details. I’m going to ask a few more questions to get a clearer picture.", timestamp: new Date() });
+            speak("Thank you for those details. I’ll ask a few more questions for clarity.");
+            addMessage({ sender: 'doctor', text: "Thank you for those details. I’ll ask a few more questions for clarity.", timestamp: new Date() });
             setStep('dynamicFollowupLoading');
           }
         } finally {
@@ -450,15 +426,14 @@ const App: React.FC = () => {
     }
   }, [step, currentStaticIndex, staticFollowUpQuestions, staticFollowUpAnswers, voiceInput, isManuallyPaused]);
 
-  /** Dynamic Follow-Up Questions */
+  /** Ask dynamic follow-up questions */
   useEffect(() => {
     if (step === 'dynamicFollowupLoading' && !isLoadingDynamicRef.current && !isManuallyPaused) {
       isLoadingDynamicRef.current = true;
       window.speechSynthesis.cancel();
-      speak("I’m putting together a few more questions to help me understand your situation even better. Just a moment.");
-      addMessage({ sender: 'doctor', text: "I’m putting together a few more questions to help me understand your situation even better. Just a moment.", timestamp: new Date() });
+      speak("One moment while I prepare a few more personalized questions.");
+      addMessage({ sender: 'doctor', text: "One moment while I prepare a few more personalized questions.", timestamp: new Date() });
       setLoading(true);
-
       (async () => {
         try {
           const staticQA = staticFollowUpQuestions.map((q, i) => ({ question: q, answer: staticFollowUpAnswers[i] }));
@@ -468,8 +443,8 @@ const App: React.FC = () => {
           setCurrentDynamicIndex(0);
           setStep('dynamicFollowup');
         } catch (error) {
-          speak("I’m sorry, we couldn’t generate more questions, but I’ll do my best with what we have. Let’s move forward.");
-          addMessage({ sender: 'doctor', text: "I’m sorry, we couldn’t generate more questions, but I’ll do my best with what we have. Let’s move forward.", timestamp: new Date() });
+          speak("I’m sorry, we couldn’t generate more questions. Let’s move forward.");
+          addMessage({ sender: 'doctor', text: "I’m sorry, we couldn’t generate more questions. Let’s move forward.", timestamp: new Date() });
           setStep('final');
         } finally {
           setLoading(false);
@@ -485,12 +460,11 @@ const App: React.FC = () => {
           const newDynAnswers = [...dynamicFollowUpAnswers];
           newDynAnswers[currentDynamicIndex] = result;
           setDynamicFollowUpAnswers(newDynAnswers);
-
           if (currentDynamicIndex + 1 < dynamicFollowUpQuestions.length) {
             setCurrentDynamicIndex(currentDynamicIndex + 1);
           } else {
-            speak("Thank you so much for all your answers. I’m now putting together your care plan.");
-            addMessage({ sender: 'doctor', text: "Thank you so much for all your answers. I’m now putting together your care plan.", timestamp: new Date() });
+            speak("Thank you for all your answers. I’m now creating your care plan.");
+            addMessage({ sender: 'doctor', text: "Thank you for all your answers. I’m now creating your care plan.", timestamp: new Date() });
             setStep('final');
           }
         } finally {
@@ -500,16 +474,12 @@ const App: React.FC = () => {
     }
   }, [step, dynamicFollowUpQuestions, currentDynamicIndex, transcript, symptomSummary, staticFollowUpQuestions, staticFollowUpAnswers, voiceInput, isManuallyPaused]);
 
-  /** Generate Final Guidelines */
+  /** Generate final guidelines and auto-play audio */
   useEffect(() => {
     if (step === 'final' && !loading && !isManuallyPaused) {
       setLoading(true);
-      speak("I’m working on creating a special care plan just for you to help you feel better soon.");
-      addMessage({ sender: 'doctor', text: "I’m working on creating a special care plan just for you to help you feel better soon.", timestamp: new Date() });
-
       const staticQA = staticFollowUpQuestions.map((q, i) => ({ question: q, answer: staticFollowUpAnswers[i] }));
       const dynamicQA = dynamicFollowUpQuestions.map((q, i) => ({ question: q, answer: dynamicFollowUpAnswers[i] }));
-
       fetch(`${API_BASE_URL}/generate_guidelines`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -528,14 +498,20 @@ const App: React.FC = () => {
           if (data.summary && data.guidelines) {
             setSummary(data.summary);
             setGuidelines(data.guidelines);
-            if (data.audio_data) setAudioSrc(data.audio_data);
-            speak(`Here’s a quick summary of your care plan: ${data.summary}. For more details, check the full plan. If you need anything else, don’t hesitate to reach out.`);
-            addMessage({ sender: 'doctor', text: `Here’s a quick summary of your care plan: ${data.summary}. For more details, check the full plan. If you need anything else, don’t hesitate to reach out.`, timestamp: new Date() });
+            if (data.audio_data) {
+              setAudioSrc(data.audio_data);
+              // Auto-play audio after a short delay
+              setTimeout(() => {
+                if (audioRef.current) {
+                  audioRef.current.play().catch(err => console.error("Auto-play error:", err));
+                }
+              }, 500);
+            }
           }
         })
         .catch(() => {
-          speak("Oh, I’m sorry, something went wrong while making your care plan. Could you try again later? We’re here to help.");
-          addMessage({ sender: 'doctor', text: "Oh, I’m sorry, something went wrong while making your care plan. Could you try again later? We’re here to help.", timestamp: new Date() });
+          speak("Oh, something went wrong while making your care plan. Please try again later.");
+          addMessage({ sender: 'doctor', text: "Oh, something went wrong while making your care plan. Please try again later.", timestamp: new Date() });
         })
         .finally(() => {
           setLoading(false);
@@ -555,7 +531,7 @@ const App: React.FC = () => {
     setCurrentStaticIndex(0);
     setCurrentDynamicIndex(0);
     setGuidelines('');
-    setSummary(''); // Added to clear summary
+    setSummary('');
     setAudioSrc('');
     setConversation([]);
     setOverlayVisible(true);
@@ -572,7 +548,7 @@ const App: React.FC = () => {
         <div className="relative w-full h-4 mt-4 overflow-hidden bg-teal-200 rounded-full">
           <div
             className="absolute top-0 left-0 h-full transition-all duration-500 ease-in-out bg-gradient-to-r from-teal-400 to-indigo-500"
-            style={{ width: getProgressPercentage() }}
+            style={{ width: progressPercentage }}
           />
           {["1: Share", "2: Confirm", "3: Questions", "4: More Details", "5: Care Plan"].map((label, idx) => (
             <div
@@ -587,10 +563,10 @@ const App: React.FC = () => {
             </div>
           ))}
         </div>
-        <h2 className="mt-4 text-2xl font-semibold text-center text-teal-100">{getStepIndicator()}</h2>
+        <h2 className="mt-4 text-2xl font-semibold text-center text-teal-100">{stepIndicator}</h2>
       </header>
 
-      <main className="flex-grow w-full max-w-5xl px-6 py-10 mx-auto">
+      <main className="flex-grow w-full max-w-5xl px-6 py-10 mx-auto" role="main" aria-live="polite">
         {overlayVisible && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-gradient-to-b from-teal-900/80 to-indigo-900/80 animate-fade-in" onClick={handleOverlayClick}>
             <div className="p-8 text-center transition-all transform bg-white shadow-2xl rounded-2xl hover:scale-105">
@@ -607,7 +583,7 @@ const App: React.FC = () => {
             <div className="w-full max-w-md p-8 text-center transition-all transform bg-white shadow-xl rounded-2xl animate-slide-up">
               <h2 className="mb-4 text-2xl font-semibold text-red-600">Sorry About That</h2>
               <p className="mb-6 text-gray-700">{errorMsg}</p>
-              <Button onClick={() => setErrorMsg('')} className="px-6 py-3 text-white transition-colors bg-red-500 rounded-lg hover:bg-red-600" aria-label="Try again">
+              <Button onClick={() => setErrorMsg('')} className="px-6 py-3 text-white bg-red-500 rounded-lg hover:bg-red-600" aria-label="Try again">
                 Let’s Try Again
               </Button>
             </div>
@@ -622,11 +598,11 @@ const App: React.FC = () => {
             </div>
             <h1 className="text-4xl font-bold text-center text-teal-800">We’re Here for You</h1>
             <p className="max-w-lg text-lg leading-relaxed text-center text-gray-600">
-              We’re here to help you feel better. Just tell us how you’re doing, and we’ll create a plan just for you. It’s simple and personal!
+              Tell us how you’re doing, and we’ll create a personalized care plan for you.
             </p>
             <Button
               onClick={handleStartRecording}
-              className="inline-flex items-center justify-center px-8 py-4 text-white transition-all transform bg-teal-600 rounded-full shadow-lg hover:bg-teal-700 hover:scale-105"
+              className="inline-flex items-center justify-center px-8 py-4 text-white transition-transform bg-teal-600 rounded-full shadow-lg hover:bg-teal-700 hover:scale-105"
               aria-label="Start sharing how you feel"
             >
               <Mic className="w-6 h-6 mr-2" />
@@ -671,7 +647,7 @@ const App: React.FC = () => {
                 <h3 className="text-2xl font-semibold text-teal-600">Summary</h3>
                 <p className="text-lg leading-relaxed text-gray-700">{summary}</p>
                 {audioSrc && (
-                  <audio controls className="w-full mt-4">
+                  <audio ref={audioRef} controls autoPlay className="w-full mt-4">
                     <source src={audioSrc} type="audio/mp3" />
                     Your browser does not support the audio element.
                   </audio>
@@ -697,11 +673,7 @@ const App: React.FC = () => {
                     ) : (
                       <Mic className="flex-shrink-0 w-6 h-6 mr-3 text-indigo-600" />
                     )}
-                    <div
-                      className={`px-4 py-3 rounded-xl max-w-xs shadow-md ${
-                        msg.sender === 'doctor' ? 'bg-teal-50 text-gray-800' : 'bg-indigo-50 text-gray-800'
-                      }`}
-                    >
+                    <div className={`px-4 py-3 rounded-xl max-w-xs shadow-md ${msg.sender === 'doctor' ? 'bg-teal-50 text-gray-800' : 'bg-indigo-50 text-gray-800'}`}>
                       <p className="text-sm leading-relaxed">{msg.text}</p>
                       <p className="mt-1 text-xs text-gray-500">{msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
                     </div>
@@ -721,7 +693,9 @@ const App: React.FC = () => {
                       {staticFollowUpQuestions.map((q, i) => (
                         <li key={`static-${i}`} className="p-3 rounded-lg bg-teal-50">
                           <span className="block font-medium text-teal-800">{q}</span>
-                          {staticFollowUpAnswers[i] && <p className="mt-1 text-gray-600">You mentioned: {staticFollowUpAnswers[i]}</p>}
+                          {staticFollowUpAnswers[i] && (
+                            <p className="mt-1 text-gray-600">You mentioned: {staticFollowUpAnswers[i]}</p>
+                          )}
                         </li>
                       ))}
                     </ul>
@@ -734,7 +708,9 @@ const App: React.FC = () => {
                       {dynamicFollowUpQuestions.map((q, i) => (
                         <li key={`dynamic-${i}`} className="p-3 rounded-lg bg-indigo-50">
                           <span className="block font-medium text-indigo-800">{q}</span>
-                          {dynamicFollowUpAnswers[i] && <p className="mt-1 text-gray-600">You mentioned: {dynamicFollowUpAnswers[i]}</p>}
+                          {dynamicFollowUpAnswers[i] && (
+                            <p className="mt-1 text-gray-600">You mentioned: {dynamicFollowUpAnswers[i]}</p>
+                          )}
                         </li>
                       ))}
                     </ul>
@@ -746,14 +722,14 @@ const App: React.FC = () => {
         )}
 
         {micActive && currentPrompt && (
-          <div className="fixed max-w-md p-4 text-center text-gray-800 transform -translate-x-1/2 bg-teal-100 rounded-lg shadow-lg top-20 left-1/2">
+          <div className="fixed max-w-md p-4 text-center text-gray-800 transform -translate-x-1/2 bg-teal-100 rounded-lg shadow-lg top-20 left-1/2 animate-fade-in">
             <p>{currentPrompt}</p>
           </div>
         )}
       </main>
 
       <footer className="w-full py-6 text-center text-teal-100 bg-teal-700">
-        <p className="text-sm">You’re our priority. This isn’t a replacement for seeing a doctor in person.</p>
+        <p className="text-sm">Your health is our priority. This isn’t a replacement for professional medical advice.</p>
       </footer>
 
       {micActive && (
@@ -795,7 +771,7 @@ const App: React.FC = () => {
               speak("Pausing now. Tap 'Resume' whenever you’re ready.");
             }
           }}
-          className="fixed px-4 py-2 text-white transition-all bg-teal-600 rounded-full shadow-lg bottom-4 left-4 hover:bg-teal-700"
+          className="fixed px-4 py-2 text-white transition-colors bg-teal-600 rounded-full shadow-lg bottom-4 left-4 hover:bg-teal-700"
           aria-label={isManuallyPaused ? "Resume the process" : "Pause the process"}
         >
           {isManuallyPaused ? 'Resume' : 'Pause'}
@@ -805,7 +781,7 @@ const App: React.FC = () => {
       {step !== 'initial' && (
         <Button
           onClick={handleRestart}
-          className="fixed px-4 py-2 text-white transition-all bg-teal-600 rounded-full shadow-lg bottom-4 right-4 hover:bg-teal-700"
+          className="fixed px-4 py-2 text-white transition-colors bg-teal-600 rounded-full shadow-lg bottom-4 right-4 hover:bg-teal-700"
           aria-label="Restart the health journey"
         >
           Restart

@@ -1,4 +1,6 @@
 /* src/styles.css */
+
+/* Keyframe Animations */
 @keyframes fadeIn {
   from { opacity: 0; }
   to { opacity: 1; }
@@ -19,6 +21,7 @@
   to { transform: rotate(360deg); }
 }
 
+/* Animation Utility Classes */
 .animate-fade-in {
   animation: fadeIn 0.5s ease-in-out;
 }
@@ -35,13 +38,45 @@
   animation: spinSlow 4s linear infinite;
 }
 
-/* Ensure buttons are focusable and visible */
+/* Global Font & Scrollbar Styling */
+body {
+  font-family: 'Inter', sans-serif;
+  scroll-behavior: smooth;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e0;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a0aec0;
+}
+
+/* Button Focus & Hover States */
 button:focus {
   outline: 2px solid #38b2ac;
   outline-offset: 2px;
 }
 
-/* Tooltip styling for progress bar */
+button {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+button:hover {
+  transform: scale(1.05);
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+/* Tooltip Styling for Progress Bar Labels */
 .group:hover .group-hover\:block {
   display: block;
 }

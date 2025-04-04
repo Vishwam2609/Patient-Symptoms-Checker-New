@@ -566,7 +566,7 @@ class LLMHandler:
         summary_text = self.generate_summary(final_guidelines)
 
         # Return both guidelines (with disclaimer) and summary
-        return {"guidelines": final_guidelines + disclaimer, "summary": summary_text}
+        return {"guidelines": final_guidelines.rstrip() + "\n\n" + disclaimer.lstrip(), "summary": summary_text}
 
     def generate_summary(self, guidelines_text: str) -> str:
         """
