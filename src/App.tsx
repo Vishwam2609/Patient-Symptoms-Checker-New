@@ -4,7 +4,7 @@ import { Mic, Loader2, User, Activity } from 'lucide-react';
 import './styles.css';
 
 // Adjust the API_BASE_URL to match your server endpoint
-const API_BASE_URL = 'https://c508-34-125-160-155.ngrok-free.app';
+const API_BASE_URL = 'https://7f53-34-124-215-114.ngrok-free.app';
 
 // Define application steps
 type AppStep =
@@ -41,7 +41,7 @@ interface StaticFollowupItem {
 
 interface DynamicFollowupItem {
   question: string;
-  answer: string;
+  answer: string | null; // Changed from string to string | null
 }
 
 interface ConversationState {
@@ -191,7 +191,7 @@ const useVoiceInteraction = (
   }, [setMicActiveUI]);
 
   const askAndListen = useCallback(
-    (prompt: string): Promise<string> => {
+    (prompt: string, suppressPatientLog: boolean = false): Promise<string> => {
       return new Promise((resolve, reject) => {
         if (isManuallyPaused) {
           console.log('Interaction paused, rejecting request.');
@@ -211,7 +211,9 @@ const useVoiceInteraction = (
             (transcript) => {
               console.log('Recognition success:', transcript);
               if (transcript) {
-                addMessage({ sender: 'patient', text: transcript, timestamp: new Date() });
+                if (!suppressPatientLog) {
+                  addMessage({ sender: 'patient', text: transcript, timestamp: new Date() });
+                }
                 resolve(transcript);
               } else {
                 addMessage({ sender: 'patient', text: '[No audible response]', timestamp: new Date() });
@@ -319,6 +321,35 @@ async function submitAnswerAndContinue(
   }
 }
 
+// Add new API function for asking a question
+async function askQuestionAboutGuidelines(
+  question: string,
+  guidelines: string
+): Promise<{
+  status: string;
+  answer?: string;
+  error?: string;
+}> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/ask_question`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+      body: JSON.stringify({ question, guidelines }),
+    });
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ error: `HTTP error ${response.status}` }));
+      console.error('Ask Question API Error:', response.status, errorData);
+      return { status: 'error', error: errorData?.error || `Request failed with status ${response.status}` };
+    }
+    const data = await response.json();
+    console.log('Ask Question Response:', data);
+    return data;
+  } catch (error) {
+    console.error('Network or fetch error in askQuestionAboutGuidelines:', error);
+    return { status: 'error', error: `Network error: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 // Main App Component
 const App: React.FC = () => {
   const [step, setStep] = useState<AppStep>('initial');
@@ -335,6 +366,12 @@ const App: React.FC = () => {
   const [conversation, setConversation] = useState<Message[]>([]);
   const [micActiveUI, setMicActiveUI] = useState<boolean>(false);
   const [isManuallyPaused, setIsManuallyPaused] = useState<boolean>(false);
+
+  // New state for question-asking
+  const [audioFinished, setAudioFinished] = useState<boolean>(false);
+  const [isAskingQuestion, setIsAskingQuestion] = useState<boolean>(false);
+  const [patientQuestion, setPatientQuestion] = useState<string>('');
+  const [questionAnswer, setQuestionAnswer] = useState<string>('');
 
   const isProcessingRef = useRef<boolean>(false);
   const conversationEndRef = useRef<HTMLDivElement>(null);
@@ -363,6 +400,10 @@ const App: React.FC = () => {
     setIsManuallyPaused(false);
     setLoading(false);
     setLoadingMessage('');
+    setAudioFinished(false);
+    setIsAskingQuestion(false);
+    setPatientQuestion('');
+    setQuestionAnswer('');
     isProcessingRef.current = false;
     if (waitingIntervalRef.current) clearInterval(waitingIntervalRef.current);
     window.speechSynthesis.cancel();
@@ -606,6 +647,53 @@ const App: React.FC = () => {
     }
   }, [step, audioSrc]);
 
+  // New useEffect for handling patient questions
+  useEffect(() => {
+    if (isAskingQuestion && !isProcessingRef.current && !isManuallyPaused) {
+      isProcessingRef.current = true;
+      setLoading(true);
+      setLoadingMessage('Listening to your question...');
+      setErrorMsg('');
+  
+      const handlePatientQuestion = async () => {
+        try {
+          const prompt = "Feel free to ask me anything about your care plan! What would you like to know or clarify?";
+          // Suppress automatic logging in askAndListen
+          const question = await askAndListen(prompt, true);
+          setPatientQuestion(question);
+          // Explicitly log the patient’s question once here
+          addMessage({ sender: 'patient', text: question, timestamp: new Date() });
+  
+          setLoadingMessage('Generating your answer...');
+          const result = await askQuestionAboutGuidelines(question, guidelines);
+  
+          if (result.status === 'error' || !result.answer) {
+            const errorMsg = result.error || 'Sorry, I couldn’t process your question right now.';
+            setErrorMsg(errorMsg);
+            addMessage({ sender: 'doctor', text: errorMsg, timestamp: new Date() });
+            speak(errorMsg);
+          } else {
+            setQuestionAnswer(result.answer);
+            addMessage({ sender: 'doctor', text: result.answer, timestamp: new Date() });
+            speak(result.answer);
+          }
+        } catch (error) {
+          console.error('Error handling patient question:', error);
+          const errorMsg = 'Sorry, I had trouble understanding your question. Would you like to try again?';
+          setErrorMsg(errorMsg);
+          addMessage({ sender: 'doctor', text: errorMsg, timestamp: new Date() });
+          speak(errorMsg);
+        } finally {
+          setIsAskingQuestion(false);
+          setLoading(false);
+          isProcessingRef.current = false;
+        }
+      };
+  
+      handlePatientQuestion();
+    }
+  }, [isAskingQuestion, askAndListen, guidelines, isManuallyPaused, addMessage]);
+
   const handleTogglePause = () => {
     if (isManuallyPaused) {
       setIsManuallyPaused(false);
@@ -704,7 +792,12 @@ const App: React.FC = () => {
                 <p className="text-base leading-relaxed text-gray-700">{summary}</p>
                 {audioSrc && (
                   <div className="mt-4">
-                    <audio ref={audioRef} controls className="w-full h-10">
+                    <audio
+                      ref={audioRef}
+                      controls
+                      className="w-full h-10"
+                      onEnded={() => setAudioFinished(true)}
+                    >
                       <source src={audioSrc} type="audio/mp3" />
                       Your browser does not support the audio element.
                     </audio>
@@ -716,6 +809,29 @@ const App: React.FC = () => {
               <div className="mt-4">
                 <h3 className="mb-2 text-xl font-semibold text-teal-600">Detailed Guidelines</h3>
                 <div className="space-y-2 text-base leading-relaxed text-gray-700 whitespace-pre-wrap">{guidelines}</div>
+              </div>
+            )}
+            {audioFinished && (
+              <div className="mt-6 text-center">
+                <Button
+                  onClick={() => setIsAskingQuestion(true)}
+                  className="px-6 py-2 text-white bg-indigo-600 rounded-lg hover:bg-indigo-700"
+                  disabled={isAskingQuestion || isProcessingRef.current}
+                  aria-label="Ask a question about your care plan"
+                >
+                  Ask a Question
+                </Button>
+              </div>
+            )}
+            {patientQuestion && questionAnswer && (
+              <div className="p-4 mt-6 border-t border-teal-200">
+                <h3 className="mb-2 text-lg font-semibold text-teal-600">Your Question</h3>
+                <p className="text-sm text-gray-700">
+                  <strong>Q:</strong> {patientQuestion}
+                </p>
+                <p className="mt-2 text-sm text-gray-700">
+                  <strong>A:</strong> {questionAnswer}
+                </p>
               </div>
             )}
             <div className="mt-8 text-center">
@@ -774,51 +890,54 @@ const App: React.FC = () => {
             <div className="lg:col-span-2 bg-white p-4 sm:p-6 rounded-2xl shadow-lg h-[30rem] overflow-auto transition-all hover:shadow-xl">
               <h2 className="mb-4 text-xl font-semibold text-teal-700">Current Summary</h2>
               {conversationState?.symptom_summary ? (
-                <div className="space-y-2 text-sm">
-                  <p>
-                    <strong className="font-medium text-teal-700">Main Symptom:</strong>{' '}
-                    {conversationState.symptom_summary.key_symptom || 'Not identified'}
-                  </p>
-                  <p>
-                    <strong className="font-medium text-teal-700">Severity:</strong>{' '}
-                    {conversationState.symptom_summary.severity || 'Not specified'}
-                  </p>
-                  <p>
-                    <strong className="font-medium text-teal-700">Onset/Duration:</strong>{' '}
-                    {conversationState.symptom_summary.onset_duration || 'Not specified'}
-                  </p>
-                  <p>
-                    <strong className="font-medium text-teal-700">Location:</strong>{' '}
-                    {conversationState.symptom_summary.location || 'Not specified'}
-                  </p>
-                  <p>
-                    <strong className="font-medium text-teal-700">Character:</strong>{' '}
-                    {conversationState.symptom_summary.character || 'Not specified'}
-                  </p>
-                  <p>
-                    <strong className="font-medium text-teal-700">Other Symptoms:</strong>{' '}
-                    {conversationState.symptom_summary.associated_symptoms || 'None mentioned'}
-                  </p>
+                <div className="space-y-3 text-sm">
+                  {/* Main Symptom */}
+                  <div>
+                    <p>
+                      <strong className="font-medium text-teal-700">Main Symptom:</strong>{' '}
+                      {conversationState.symptom_summary.key_symptom || 'Not identified'}
+                    </p>
+                  </div>
+                  {/* Static Follow-up Questions */}
+                  {conversationState.static_followup.some((item) => item.answer) && (
+                    <div className="pt-4 mt-4 border-t">
+                      <h3 className="mb-2 text-base font-semibold text-teal-700">Static Questions</h3>
+                      <ul className="space-y-2">
+                        {conversationState.static_followup
+                          .filter((item) => item.answer)
+                          .map((item, idx) => (
+                            <li key={`static-${idx}`}>
+                              <p>
+                                <strong>Q:</strong> {item.question} <br />
+                                <strong>A:</strong> {item.answer}
+                              </p>
+                            </li>
+                          ))}
+                      </ul>
+                    </div>
+                  )}
+                  {/* Dynamic Follow-up Questions */}
+                  {conversationState.dynamic_followup_history.some((item) => item.answer) && (
+                    <div className="pt-4 mt-4 border-t">
+                      <h3 className="mb-2 text-base font-semibold text-teal-700">Dynamic Questions</h3>
+                      <ul className="space-y-2">
+                        {conversationState.dynamic_followup_history
+                          .filter((item) => item.answer)
+                          .map((item, idx) => (
+                            <li key={`dynamic-${idx}`}>
+                              <p>
+                                <strong>Q:</strong> {item.question} <br />
+                                <strong>A:</strong> {item.answer}
+                              </p>
+                            </li>
+                          ))}
+                      </ul>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <p className="text-gray-500">Summary will appear here after your initial statement.</p>
               )}
-              {conversationState?.static_followup &&
-                conversationState.static_followup.some((item) => item.answer) && (
-                  <div className="pt-4 mt-4 border-t">
-                    <h3 className="mb-2 text-base font-semibold text-teal-700">Standard Questions Answered</h3>
-                    <ul className="space-y-1 text-sm">
-                      {conversationState.static_followup
-                        .filter((item) => item.answer)
-                        .map((item, idx) => (
-                          <li key={`static-ans-${idx}`}>
-                            <strong>Q:</strong> {item.question} <br />
-                            <strong>A:</strong> {item.answer}
-                          </li>
-                        ))}
-                    </ul>
-                  </div>
-                )}
             </div>
           </div>
         )}

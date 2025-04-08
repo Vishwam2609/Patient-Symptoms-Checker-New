@@ -368,9 +368,9 @@ class LLMHandler:
                 q_text = re.sub(r'^["“](.*?)["”]?$', r'\1', q_text).strip()
 
                 # Validate as a unique question
-                if (q_text.endswith('?') and 
-                    len(q_text) > 10 and 
-                    q_text.lower() not in seen_questions_lower and 
+                if (q_text.endswith('?') and
+                    len(q_text) > 10 and
+                    q_text.lower() not in seen_questions_lower and
                     q_text.lower() not in {q.lower() for q in extracted_questions}):
                     extracted_questions.append(q_text)
                     seen_questions_lower.add(q_text.lower())
@@ -541,11 +541,11 @@ class LLMHandler:
         if not summary or summary.startswith("Error:") or len(summary.split()) < 5:
             logger.warning(f"Generated summary is invalid or too short: '{summary}'. Using fallback.")
             return "Please follow the detailed home care advice provided. Contact a doctor if your symptoms worsen or you notice concerning changes."
-        
+
         # Ensure it ends with a period for readability
         if not summary.endswith(('.', '!', '?')):
             summary += '.'
-        
+
         logger.info(f"Successfully generated summary: {summary}")
         return summary.strip()
 
@@ -980,6 +980,103 @@ def interview_step():
             "conversation_state": current_state, # Return state for potential debugging on client
             "audio_response": None
         }), 500
+
+@app.route("/ask_question", methods=["POST"])
+def ask_question():
+    """
+    Handles patient questions by answering based on the provided Care Plan Guidelines and,
+    when necessary, supplementing with widely accepted external medical knowledge.
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            logging.warning("Received request with invalid/empty JSON payload.")
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        question = data.get("question", "").strip()
+        guidelines = data.get("guidelines", "").strip()
+
+        if not question or not guidelines:
+            logging.warning("Missing 'question' or 'guidelines' in request.")
+            return jsonify({"error": "Missing 'question' or 'guidelines' field"}), 400
+
+        # --- Final Optimized Prompt ---
+        # The prompt instructs the model to primarily use the provided guidelines
+        # but also incorporate external medical knowledge if the question involves symptoms
+        # or issues that may not be fully covered in the guidelines.
+        prompt = (
+            f"You are an AI assistant tasked with answering patient questions about their symptoms and care.\n"
+            f"Use the provided Care Plan Guidelines as your primary source, but if the patient's question "
+            f"involves symptoms or topics not explicitly covered in the guidelines, supplement your answer "
+            f"with widely accepted external medical knowledge.\n"
+            f"Provide a direct, accurate, and complete answer in one or two plain language sentences. "
+            f"Do not include numbered lists, bullet points, or introductory phrases.\n\n"
+            f"**Care Plan Guidelines:**\n{guidelines}\n\n"
+            f"**Patient's Question:**\n{question}\n\n"
+            f"**Answer:**"
+        )
+
+        logging.info(f"Attempting to generate answer for question: '{question}'")
+
+        # --- LLM Call ---
+        raw_answer = llm_handler.generate_text(
+            prompt,
+            max_new_tokens=90,      # Increased token budget for thorough processing
+            num_beams=5,
+            temperature=0.5,        # Lower temperature for more deterministic output
+            repetition_penalty=1.2
+        ).strip()
+
+        logging.info(f"Raw answer from LLM: '{raw_answer}'")
+
+        # --- Processing Logic ---
+        answer = raw_answer
+
+        # --- Cleanup Stage ---
+        # Remove leading list markers (e.g., "1. ", "* ") if present.
+        answer = re.sub(r"^\s*(\d+\.|[*-])\s*", "", answer).strip()
+        # Remove any markdown formatting such as bold markers.
+        answer = answer.replace("**", "")
+        # Remove common conversational prefixes if they appear.
+        common_prefixes = [
+            "Answer:", "Based on the guidelines,", "According to the guidelines,",
+            "The guidelines state", "You should"
+        ]
+        answer_lower = answer.lower()
+        for prefix in common_prefixes:
+            if answer_lower.startswith(prefix.lower()):
+                answer = answer[len(prefix):].strip()
+                break
+
+        # --- Formatting Stage ---
+        # Capitalize the first letter.
+        if answer:
+            answer = answer[0].upper() + answer[1:]
+        # Ensure the answer ends with appropriate punctuation.
+        if answer and not answer.endswith(('.', '!', '?')):
+            answer += '.'
+
+        # --- Final Quality Check ---
+        answer_words = answer.split()
+        MIN_MEANINGFUL_WORDS = 4  # Minimum number of words to consider an answer meaningful.
+        if not answer or len(answer_words) < MIN_MEANINGFUL_WORDS:
+            logging.warning(
+                f"Answer derived from guidelines and external info was too short/empty. Raw: '{raw_answer}'. Question: '{question}'. "
+                "Using fallback."
+            )
+            answer = ("I couldn't determine a specific answer from the provided guidelines and common medical knowledge. "
+                      "Please contact your healthcare provider for more information.")
+
+        logging.info(f"Final answer for question '{question}': '{answer}'")
+
+        return jsonify({
+            "status": "success",
+            "answer": answer
+        })
+
+    except Exception as e:
+        logging.exception("Error occurred in /ask_question route.")
+        return jsonify({"error": "Sorry, an internal error occurred while processing your question."}), 500
 
 # --- Main Execution ---
 if __name__ == "__main__":
