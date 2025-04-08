@@ -1,23 +1,22 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Button } from './components/ui/button';
-import { Mic, Loader2, User } from 'lucide-react';
+import { Button } from './components/ui/button'; // Assuming Shadcn UI component
+import { Mic, Loader2, User, Activity } from 'lucide-react';
 import './styles.css';
 
 // Adjust the API_BASE_URL to match your server endpoint
-const API_BASE_URL = 'https://0881-34-142-199-38.ngrok-free.app/';
+const API_BASE_URL = 'https://c508-34-125-160-155.ngrok-free.app';
 
 // Define application steps
 type AppStep =
   | 'initial'
   | 'recording'
   | 'review'
-  | 'followupLoading'
-  | 'followup'
-  | 'dynamicFollowupLoading'
-  | 'dynamicFollowup'
+  | 'startingInterview'
+  | 'interviewing'
+  | 'submittingAnswer'
   | 'final';
 
-// Define message structure for conversation
+// Define message structure
 interface Message {
   sender: 'doctor' | 'patient';
   text: string;
@@ -34,229 +33,359 @@ interface SymptomSummary {
   associated_symptoms: string;
 }
 
-/** Utility to speak text */
-function speak(text: string) {
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.rate = 0.9;
-  utterance.pitch = 1.0;
-  window.speechSynthesis.speak(utterance);
+// Define structures for conversation state
+interface StaticFollowupItem {
+  question: string;
+  answer: string | null;
 }
 
-/** Starts speech recognition with silence detection */
+interface DynamicFollowupItem {
+  question: string;
+  answer: string;
+}
+
+interface ConversationState {
+  transcript: string;
+  symptom_summary: SymptomSummary;
+  static_followup: StaticFollowupItem[];
+  dynamic_followup_history: DynamicFollowupItem[];
+  current_question: string | null;
+}
+
+// Custom interface for SpeechRecognitionEvent
+interface CustomSpeechRecognitionEvent extends Event {
+  results: SpeechRecognitionResultList;
+  resultIndex: number;
+}
+
+// Custom interface for SpeechRecognitionErrorEvent to resolve TypeScript error
+interface CustomSpeechRecognitionErrorEvent extends Event {
+  error: string;
+  message: string;
+}
+
+// Define SpeechRecognition globally
+const SpeechRecognitionConstructor =
+  (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+// Utility Functions
+function speak(text: string, onEndCallback?: () => void) {
+  if (!text) return;
+  try {
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'en-US';
+    utterance.rate = 0.95;
+    utterance.pitch = 1.0;
+    if (onEndCallback) utterance.onend = onEndCallback;
+    utterance.onerror = (event) => {
+      console.error('SpeechSynthesis Error:', event);
+      if (onEndCallback) onEndCallback();
+    };
+    window.speechSynthesis.speak(utterance);
+  } catch (error) {
+    console.error('Error initiating speech synthesis:', error);
+    if (onEndCallback) onEndCallback();
+  }
+}
+
 const startSpeechRecognition = (
   onResult: (transcript: string) => void,
-  onError: (err: any) => void,
-  toggleMic?: (active: boolean) => void
-) => {
-  const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-  if (!SpeechRecognition) {
-    onError("Speech recognition not supported. Please type your response below.");
+  onError: (errorType: string, errorMessage: string) => void,
+  setMicActiveUI: (active: boolean) => void
+): any | null => {
+  if (!SpeechRecognitionConstructor) {
+    onError(
+      'unsupported',
+      'Speech recognition not supported by this browser. Please type your response if possible.'
+    );
     return null;
   }
-  const recognition = new SpeechRecognition();
+
+  const recognition = new SpeechRecognitionConstructor();
   recognition.lang = 'en-US';
   recognition.interimResults = true;
   recognition.maxAlternatives = 1;
   recognition.continuous = true;
 
   let finalTranscript = '';
-  let silenceTimeout: NodeJS.Timeout | null = null;
-  const SILENCE_THRESHOLD = 1000;
+  let silenceTimer: NodeJS.Timeout | null = null;
+  const SILENCE_DURATION = 2000;
 
-  recognition.onstart = () => toggleMic && toggleMic(true);
+  recognition.onstart = () => {
+    console.log('Speech recognition started');
+    setMicActiveUI(true);
+    if (silenceTimer) clearTimeout(silenceTimer);
+  };
 
-  recognition.onresult = (event: any) => {
+  recognition.onresult = (event: CustomSpeechRecognitionEvent) => {
+    console.log('Speech result received');
+    if (silenceTimer) clearTimeout(silenceTimer);
+
     let interimTranscript = '';
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const result = event.results[i];
-      if (result.isFinal) {
-        finalTranscript += result[0].transcript + ' ';
+    for (let i = event.resultIndex; i < event.results.length; ++i) {
+      if (event.results[i].isFinal) {
+        finalTranscript += event.results[i][0].transcript.trim() + ' ';
       } else {
-        interimTranscript += result[0].transcript;
+        interimTranscript += event.results[i][0].transcript;
       }
     }
-    if (interimTranscript || finalTranscript) {
-      if (silenceTimeout) clearTimeout(silenceTimeout);
-      silenceTimeout = setTimeout(() => recognition.stop(), SILENCE_THRESHOLD);
-    }
+    console.log('Interim:', interimTranscript, 'Final:', finalTranscript);
+
+    silenceTimer = setTimeout(() => {
+      console.log('Silence detected, stopping recognition.');
+      recognition.stop();
+    }, SILENCE_DURATION);
   };
 
   recognition.onend = () => {
-    toggleMic && toggleMic(false);
-    if (silenceTimeout) clearTimeout(silenceTimeout);
-    onResult(finalTranscript.trim() || '');
+    console.log('Speech recognition ended');
+    setMicActiveUI(false);
+    if (silenceTimer) clearTimeout(silenceTimer);
+    const result = finalTranscript.trim();
+    if (result) onResult(result);
+    else onError('no-speech', 'No speech detected or recognition ended abruptly.');
   };
 
-  recognition.onerror = (event: any) => {
-    toggleMic && toggleMic(false);
-    onError(event.error);
-    if (silenceTimeout) clearTimeout(silenceTimeout);
+  recognition.onerror = (event: CustomSpeechRecognitionErrorEvent) => {
+    console.error('SpeechRecognition Error:', event.error, event.message);
+    setMicActiveUI(false);
+    if (silenceTimer) clearTimeout(silenceTimer);
+    onError(event.error, event.message);
   };
 
-  recognition.start();
+  try {
+    recognition.start();
+    silenceTimer = setTimeout(() => {
+      console.log('Initial silence timeout, stopping recognition.');
+      recognition.stop();
+    }, SILENCE_DURATION * 2);
+  } catch (e) {
+    console.error('Failed to start speech recognition:', e);
+    onError('start-failed', 'Could not start voice input. Please check microphone permissions.');
+    return null;
+  }
+
   return recognition;
 };
 
-/** Speaks a message and listens for a response */
-const speakAndListen = (
-  message: string,
-  onResult: (result: string) => void,
+// Custom Hook
+const useVoiceInteraction = (
   addMessage: (msg: Message) => void,
-  toggleMic: (active: boolean) => void,
-  setCurrentPrompt: (prompt: string) => void
+  setMicActiveUI: (active: boolean) => void,
+  setErrorMsg: (msg: string) => void,
+  isManuallyPaused: boolean
 ) => {
-  window.speechSynthesis.cancel();
-  setCurrentPrompt(message);
-  const utterance = new SpeechSynthesisUtterance(message);
-  utterance.rate = 0.9;
-  utterance.pitch = 1.0;
-  utterance.onend = () => {
-    setCurrentPrompt('');
-    startSpeechRecognition(
-      (result) => {
-        addMessage({ sender: 'patient', text: result, timestamp: new Date() });
-        onResult(result);
-      },
-      (err) => onResult(""),
-      toggleMic
-    );
-  };
-  window.speechSynthesis.speak(utterance);
-  addMessage({ sender: 'doctor', text: message, timestamp: new Date() });
-};
+  const recognitionRef = useRef<any>(null);
 
-/** Custom hook for voice input with retry logic */
-const useVoiceInput = (
-  addMessage: (msg: Message) => void,
-  toggleMic: (active: boolean) => void,
-  setCurrentPrompt: (prompt: string) => void
-) => {
-  const voiceInput = useCallback(
-    async (promptMsg: string): Promise<string> => {
-      let attempts = 0;
-      const MAX_ATTEMPTS = 3;
-      while (true) {
-        try {
-          const result: string = await new Promise((resolve) => {
-            speakAndListen(promptMsg, resolve, addMessage, toggleMic, setCurrentPrompt);
-          });
-          if (result) return result;
-          throw new Error("No input detected");
-        } catch (err) {
-          attempts++;
-          if (attempts < MAX_ATTEMPTS) {
-            const retryMsg = `I’m sorry, I didn’t catch that. Could you say it again? This is try ${attempts + 1} of ${MAX_ATTEMPTS}.`;
-            speak(retryMsg);
-            addMessage({ sender: 'doctor', text: retryMsg, timestamp: new Date() });
-          } else {
-            const continueMsg = "I’m still having trouble hearing you. Let’s try one more time, or you can type if you prefer.";
-            speak(continueMsg);
-            addMessage({ sender: 'doctor', text: continueMsg, timestamp: new Date() });
-            attempts = 0;
-          }
+  const cleanupRecognition = useCallback(() => {
+    if (recognitionRef.current) {
+      recognitionRef.current.onstart = null;
+      recognitionRef.current.onresult = null;
+      recognitionRef.current.onerror = null;
+      recognitionRef.current.onend = null;
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+      setMicActiveUI(false);
+    }
+  }, [setMicActiveUI]);
+
+  const askAndListen = useCallback(
+    (prompt: string): Promise<string> => {
+      return new Promise((resolve, reject) => {
+        if (isManuallyPaused) {
+          console.log('Interaction paused, rejecting request.');
+          return reject('Interaction is manually paused.');
         }
-      }
+
+        cleanupRecognition();
+        addMessage({ sender: 'doctor', text: prompt, timestamp: new Date() });
+
+        speak(prompt, () => {
+          if (isManuallyPaused) {
+            console.log('Interaction paused after speaking, rejecting listen.');
+            return reject('Interaction is manually paused.');
+          }
+          console.log('Speak finished, starting recognition...');
+          recognitionRef.current = startSpeechRecognition(
+            (transcript) => {
+              console.log('Recognition success:', transcript);
+              if (transcript) {
+                addMessage({ sender: 'patient', text: transcript, timestamp: new Date() });
+                resolve(transcript);
+              } else {
+                addMessage({ sender: 'patient', text: '[No audible response]', timestamp: new Date() });
+                reject('No audible response recorded.');
+              }
+              cleanupRecognition();
+            },
+            (errorType, errorMessage) => {
+              console.error('Recognition error:', errorType, errorMessage);
+              let userMessage = `Sorry, I had trouble understanding. ${errorMessage}`;
+              if (errorType === 'no-speech') userMessage = "I didn't hear anything. Could you please speak up?";
+              else if (errorType === 'audio-capture')
+                userMessage = 'Hmm, I couldn’t capture audio. Please check your microphone connection and permissions.';
+              else if (errorType === 'not-allowed')
+                userMessage = 'I need microphone access to hear you. Please grant permission in your browser settings.';
+              setErrorMsg(userMessage);
+              addMessage({ sender: 'doctor', text: userMessage, timestamp: new Date() });
+              speak(userMessage);
+              reject(errorMessage);
+              cleanupRecognition();
+            },
+            setMicActiveUI
+          );
+          if (!recognitionRef.current) {
+            reject('Failed to initialize speech recognition.');
+            cleanupRecognition();
+          }
+        });
+      });
     },
-    [addMessage, toggleMic, setCurrentPrompt]
+    [addMessage, setMicActiveUI, setErrorMsg, isManuallyPaused, cleanupRecognition]
   );
-  return { voiceInput };
+
+  useEffect(() => {
+    return () => {
+      window.speechSynthesis.cancel();
+      cleanupRecognition();
+    };
+  }, [cleanupRecognition]);
+
+  return { askAndListen, cancelListening: cleanupRecognition };
 };
 
-/** API function to extract full symptom summary with retries */
-async function extractSymptoms(transcript: string, retries = 3): Promise<SymptomSummary> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const response = await fetch(`${API_BASE_URL}/extract_symptom_summary`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcript }),
-      });
-      if (!response.ok) throw new Error(`Attempt ${attempt} failed`);
-      const data = await response.json();
-      return data.symptom_summary;
-    } catch (error) {
-      if (attempt === retries) throw new Error("Symptom extraction failed after retries");
-      await new Promise(resolve => setTimeout(resolve, 1000));
+// API Functions
+async function startInterview(transcript: string): Promise<{
+  status: string;
+  conversation_state: ConversationState;
+  audio_response: string | null;
+  guidelines?: string;
+  summary?: string;
+  error?: string;
+}> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/start_interview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+      body: JSON.stringify({ transcript }),
+    });
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ error: `HTTP error ${response.status}` }));
+      console.error('Start Interview API Error:', response.status, errorData);
+      return { status: 'error', error: errorData?.error || `Request failed with status ${response.status}`, conversation_state: null!, audio_response: null };
     }
+    const data = await response.json();
+    console.log('Start Interview Response:', data);
+    return data;
+  } catch (error) {
+    console.error('Network or fetch error in startInterview:', error);
+    return { status: 'error', error: `Network error: ${error instanceof Error ? error.message : String(error)}`, conversation_state: null!, audio_response: null };
   }
-  throw new Error("Unexpected error in extractSymptoms");
 }
 
-/** API function to generate follow-up questions */
-async function generateFollowupQuestions(
-  reviewed_transcript: string,
-  symptom_summary: SymptomSummary,
-  static_followup: { question: string; answer: string }[],
-  retries = 3
-): Promise<string[]> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const response = await fetch(`${API_BASE_URL}/generate_followup_questions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reviewed_transcript, symptom_summary, static_followup }),
-      });
-      if (!response.ok) throw new Error(`Attempt ${attempt} failed`);
-      const data = await response.json();
-      return data.follow_up_questions;
-    } catch (error) {
-      if (attempt === retries) throw new Error("Dynamic follow-up question generation failed after retries");
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
+async function submitAnswerAndContinue(
+  currentState: ConversationState,
+  answer: string
+): Promise<{
+  status: string;
+  conversation_state: ConversationState;
+  audio_response: string | null;
+  guidelines?: string;
+  summary?: string;
+  error?: string;
+}> {
+  if (!currentState || !currentState.current_question) {
+    console.error('Cannot submit answer, invalid state:', currentState);
+    return { status: 'error', error: 'Internal error: Missing current question in state.', conversation_state: currentState, audio_response: null };
   }
-  throw new Error("Unexpected error in generateFollowupQuestions");
+  try {
+    const response = await fetch(`${API_BASE_URL}/interview_step`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+      body: JSON.stringify({ conversation_state: currentState, answer }),
+    });
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ error: `HTTP error ${response.status}` }));
+      console.error('Interview Step API Error:', response.status, errorData);
+      return { status: 'error', error: errorData?.error || `Request failed with status ${response.status}`, conversation_state: currentState, audio_response: null };
+    }
+    const data = await response.json();
+    console.log('Interview Step Response:', data);
+    return data;
+  } catch (error) {
+    console.error('Network or fetch error in submitAnswerAndContinue:', error);
+    return { status: 'error', error: `Network error: ${error instanceof Error ? error.message : String(error)}`, conversation_state: currentState, audio_response: null };
+  }
 }
 
-/** Main App Component */
+// Main App Component
 const App: React.FC = () => {
   const [step, setStep] = useState<AppStep>('initial');
   const [transcript, setTranscript] = useState<string>('');
-  const [symptomSummary, setSymptomSummary] = useState<SymptomSummary | null>(null);
-  const [staticFollowUpQuestions, setStaticFollowUpQuestions] = useState<string[]>([]);
-  const [staticFollowUpAnswers, setStaticFollowUpAnswers] = useState<string[]>([]);
-  const [dynamicFollowUpQuestions, setDynamicFollowUpQuestions] = useState<string[]>([]);
-  const [dynamicFollowUpAnswers, setDynamicFollowUpAnswers] = useState<string[]>([]);
-  const [currentStaticIndex, setCurrentStaticIndex] = useState<number>(0);
-  const [currentDynamicIndex, setCurrentDynamicIndex] = useState<number>(0);
+  const [conversationState, setConversationState] = useState<ConversationState | null>(null);
   const [guidelines, setGuidelines] = useState<string>('');
+  const [summary, setSummary] = useState<string>('');
   const [audioSrc, setAudioSrc] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
+  const [loadingMessage, setLoadingMessage] = useState<string>('');
   const [overlayVisible, setOverlayVisible] = useState<boolean>(true);
   const [welcomeSpoken, setWelcomeSpoken] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [conversation, setConversation] = useState<Message[]>([]);
-  const [micActive, setMicActive] = useState<boolean>(false);
-  const [currentPrompt, setCurrentPrompt] = useState<string>('');
+  const [micActiveUI, setMicActiveUI] = useState<boolean>(false);
   const [isManuallyPaused, setIsManuallyPaused] = useState<boolean>(false);
-  const isConfirmingRef = useRef<boolean>(false);
-  const isAskingStaticRef = useRef<boolean>(false);
-  const isAskingDynamicRef = useRef<boolean>(false);
-  const isLoadingDynamicRef = useRef<boolean>(false);
+
+  const isProcessingRef = useRef<boolean>(false);
   const conversationEndRef = useRef<HTMLDivElement>(null);
   const waitingIntervalRef = useRef<number | null>(null);
-  const [summary, setSummary] = useState<string>('');
   const audioRef = useRef<HTMLAudioElement>(null);
 
-  const addMessage = (msg: Message) => setConversation((prev) => [...prev, msg]);
-  const { voiceInput } = useVoiceInput(addMessage, setMicActive, setCurrentPrompt);
+  const currentQuestion = useMemo(() => conversationState?.current_question, [conversationState]);
 
-  // Auto-scroll conversation
+  const addMessage = useCallback((msg: Message) => {
+    setConversation((prev) => [...prev, msg]);
+  }, []);
+
+  const { askAndListen, cancelListening } = useVoiceInteraction(addMessage, setMicActiveUI, setErrorMsg, isManuallyPaused);
+
+  const resetState = useCallback(() => {
+    setStep('initial');
+    setTranscript('');
+    setConversationState(null);
+    setGuidelines('');
+    setSummary('');
+    setAudioSrc('');
+    setConversation([]);
+    setOverlayVisible(true);
+    setWelcomeSpoken(false);
+    setErrorMsg('');
+    setIsManuallyPaused(false);
+    setLoading(false);
+    setLoadingMessage('');
+    isProcessingRef.current = false;
+    if (waitingIntervalRef.current) clearInterval(waitingIntervalRef.current);
+    window.speechSynthesis.cancel();
+    cancelListening();
+  }, [cancelListening]);
+
+  const handleRestart = useCallback(() => {
+    resetState();
+  }, [resetState]);
+
   useEffect(() => {
     conversationEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [conversation]);
 
-  // Step indicator and progress percentage (memoized)
   const stepIndicator = useMemo(() => {
     switch (step) {
-      case 'initial': return 'Welcome to Your Health Journey';
-      case 'recording': return 'Step 1: Sharing How You Feel';
-      case 'review': return 'Step 2: Let’s Double-Check';
-      case 'followupLoading': return 'Step 3: Preparing Questions for You';
-      case 'followup': return 'Step 3: Learning More About You';
-      case 'dynamicFollowupLoading': return 'Step 4: Asking a Few More Things';
-      case 'dynamicFollowup': return 'Step 4: Getting to Know You Better';
-      case 'final': return 'Step 5: Your Personal Care Plan';
+      case 'initial': return 'Welcome';
+      case 'recording': return 'Step 1: Share Your Story';
+      case 'review': return 'Step 2: Confirm Your Statement';
+      case 'startingInterview': return 'Getting Ready...';
+      case 'interviewing': return 'Step 3: Answering Questions';
+      case 'submittingAnswer': return 'Processing Your Answer...';
+      case 'final': return 'Step 4: Your Care Plan';
       default: return '';
     }
   }, [step]);
@@ -264,34 +393,30 @@ const App: React.FC = () => {
   const progressPercentage = useMemo(() => {
     switch (step) {
       case 'initial': return '0%';
-      case 'recording': return '20%';
-      case 'review': return '40%';
-      case 'followupLoading': return '50%';
-      case 'followup': return '60%';
-      case 'dynamicFollowupLoading': return '70%';
-      case 'dynamicFollowup': return '80%';
+      case 'recording': return '15%';
+      case 'review': return '30%';
+      case 'startingInterview': return '40%';
+      case 'interviewing': return '50%';
+      case 'submittingAnswer': return '75%';
       case 'final': return '100%';
       default: return '0%';
     }
   }, [step]);
 
-  const getLoadingMessage = (): string => {
-    switch (step) {
-      case 'followupLoading': return "We’re preparing some thoughtful questions for you.";
-      case 'dynamicFollowupLoading': return "Tailoring a few more questions specifically for you.";
-      case 'final': return "We’re putting together your care plan. Please hold on a moment.";
-      default: return "We’re working on something special to support you...";
-    }
-  };
-
-  // Waiting message for long loading periods (including final)
   useEffect(() => {
-    if (loading && (step === 'followupLoading' || step === 'dynamicFollowupLoading' || step === 'final')) {
+    if (loading && (step === 'startingInterview' || step === 'submittingAnswer' || (step === 'final' && !guidelines))) {
+      let initialMessage = 'Hang tight, we’re working on it...';
+      if (step === 'startingInterview') initialMessage = 'Analyzing your statement and preparing first question...';
+      if (step === 'submittingAnswer') initialMessage = 'Thinking about your answer and preparing the next step...';
+      if (step === 'final' && !guidelines) initialMessage = 'Creating your personalized care plan...';
+      setLoadingMessage(initialMessage);
+
       waitingIntervalRef.current = window.setInterval(() => {
-        const waitingMsg = "We’re still working on this for you. Hang in there, we’ll be with you shortly!";
+        const waitingMsg = 'Still working on this for you, thanks for your patience!';
+        setLoadingMessage(waitingMsg);
         speak(waitingMsg);
         addMessage({ sender: 'doctor', text: waitingMsg, timestamp: new Date() });
-      }, 20000);
+      }, 25000);
     } else if (waitingIntervalRef.current) {
       clearInterval(waitingIntervalRef.current);
       waitingIntervalRef.current = null;
@@ -302,490 +427,450 @@ const App: React.FC = () => {
         waitingIntervalRef.current = null;
       }
     };
-  }, [loading, step]);
+  }, [loading, step, guidelines, addMessage]);
 
-  // Handle overlay/welcome message
   const handleOverlayClick = () => {
     if (!welcomeSpoken) {
-      speak("Hello there! We’re so glad you’re here. Whenever you’re ready, tell us how you’re feeling and we’ll create a care plan just for you.");
-      addMessage({ sender: 'doctor', text: "Hello there! We’re so glad you’re here...", timestamp: new Date() });
+      const welcomeMsg =
+        'Hello there! We’re so glad you’re here. Whenever you’re ready, tell us how you’re feeling by clicking "Let\'s Begin", and we’ll create a care plan just for you.';
+      speak(welcomeMsg);
+      addMessage({ sender: 'doctor', text: welcomeMsg, timestamp: new Date() });
       setWelcomeSpoken(true);
     }
     setOverlayVisible(false);
   };
 
   const handleStartRecording = async () => {
+    if (isProcessingRef.current || isManuallyPaused) return;
+    isProcessingRef.current = true;
     setStep('recording');
-    const result = await voiceInput("Whenever you’re ready, please tell me how you’re feeling today. What’s been going on?");
-    setTranscript(result);
-    addMessage({ sender: 'doctor', text: "Thank you for sharing. I’ve noted what you said.", timestamp: new Date() });
-    setStep('review');
+    setTranscript('');
+    setErrorMsg('');
+
+    try {
+      const initialPrompt = 'Whenever you’re ready, please tell me how you’re feeling today. What’s been going on?';
+      const result = await askAndListen(initialPrompt);
+      setTranscript(result);
+      setStep('review');
+    } catch (error) {
+      console.error('Error during initial recording:', error);
+      speak('Let’s try that initial step again. Click "Let’s Begin" when ready.');
+      addMessage({ sender: 'doctor', text: 'Let’s try that initial step again.', timestamp: new Date() });
+      setStep('initial');
+    } finally {
+      isProcessingRef.current = false;
+    }
   };
 
-  /** Confirm transcript in review step */
   useEffect(() => {
-    if (step === 'review' && !isConfirmingRef.current && !isManuallyPaused) {
-      isConfirmingRef.current = true;
-      (async () => {
-        try {
-          const reviewMsg = `I heard: "${transcript}". Is that correct? Please say "yes" or "no."`;
-          const result = await voiceInput(reviewMsg);
-          if (result.toLowerCase().includes("yes")) {
-            speak("Great! Let’s move forward.");
-            addMessage({ sender: 'doctor', text: "Great! Let’s move forward.", timestamp: new Date() });
-            setStep('followupLoading');
-          } else {
-            speak("Okay, let’s try again. How are you feeling?");
-            addMessage({ sender: 'doctor', text: "Okay, let's try again. How are you feeling?", timestamp: new Date() });
-            setStep('recording');
-            const retryResult = await voiceInput("Take your time and tell me how you’re feeling.");
-            setTranscript(retryResult);
-            setStep('review');
-          }
-        } finally {
-          isConfirmingRef.current = false;
-        }
-      })();
-    }
-  }, [step, transcript, voiceInput, isManuallyPaused]);
+    if (step === 'review' && transcript && !isProcessingRef.current && !isManuallyPaused) {
+      isProcessingRef.current = true;
+      setErrorMsg('');
 
-  /** Extract symptoms and set static questions */
-  useEffect(() => {
-    if (step === 'followupLoading' && !isManuallyPaused) {
-      window.speechSynthesis.cancel();
-      speak("Let me get some questions ready for you. Please hold on a moment.");
-      addMessage({ sender: 'doctor', text: "Let me get some questions ready for you. Please hold on a moment.", timestamp: new Date() });
-      setLoading(true);
-      (async () => {
+      const confirmTranscript = async () => {
         try {
-          const summary = await extractSymptoms(transcript);
-          setSymptomSummary(summary);
-          const cleanedSymptom = summary.key_symptom.toLowerCase().trim().replace(/[^a-z]/g, "");
-          const staticMapping: { [key: string]: string[] } = {
-            fever: [
-              "When did you first notice your fever and has it changed?",
-              "Are you experiencing chills or body aches along with the fever?",
-              "Have you recently been around someone who was sick?"
-            ],
-            coughing: [
-              "When did your cough start and is it continuous?",
-              "Is your cough dry, or are you coughing up mucus?",
-              "Are you having any trouble breathing or feeling short of breath?"
-            ],
-            headache: [
-              "When did your headache begin and how severe is it?",
-              "Is the pain localized or spread out?",
-              "Do you feel nauseous or sensitive to light and sound?"
-            ]
-          };
-          const possibleKeys = Object.keys(staticMapping);
-          const foundKey = possibleKeys.find(
-            key => cleanedSymptom === key || cleanedSymptom.includes(key) || key.includes(cleanedSymptom)
-          );
-          if (foundKey) {
-            const questions = staticMapping[foundKey];
-            setStaticFollowUpQuestions(questions);
-            setStaticFollowUpAnswers(Array(questions.length).fill(""));
-            setCurrentStaticIndex(0);
-            setStep('followup');
+          const reviewMsg = `Okay, I heard you say: "${transcript}". Is that correct? Please say "yes" or "no".`;
+          const confirmation = await askAndListen(reviewMsg);
+
+          if (confirmation.toLowerCase().includes('yes')) {
+            speak('Great! Let me analyze that for a moment.');
+            addMessage({ sender: 'doctor', text: 'Great! Let’s move forward.', timestamp: new Date() });
+            setStep('startingInterview');
           } else {
-            setStep('dynamicFollowupLoading');
+            speak('My apologies. Let’s try recording that again.');
+            addMessage({ sender: 'doctor', text: 'Okay, let’s try recording again.', timestamp: new Date() });
+            setStep('initial');
           }
         } catch (error) {
-          setErrorMsg("Sorry, we had trouble understanding. Could we start over?");
-          speak("Sorry, we had trouble understanding. Could we start over?");
+          console.error('Error during transcript confirmation:', error);
+          speak('I’m having trouble confirming. Let’s try recording again.');
+          addMessage({ sender: 'doctor', text: 'Let’s try recording again.', timestamp: new Date() });
           setStep('initial');
+        } finally {
+          isProcessingRef.current = false;
+        }
+      };
+      confirmTranscript();
+    }
+  }, [step, transcript, askAndListen, isManuallyPaused]);
+
+  useEffect(() => {
+    if (step === 'startingInterview' && transcript && !isProcessingRef.current && !isManuallyPaused) {
+      isProcessingRef.current = true;
+      setLoading(true);
+      setLoadingMessage('Analyzing your statement...');
+      setErrorMsg('');
+
+      const performStartInterview = async () => {
+        const result = await startInterview(transcript);
+
+        if (result.status === 'error' || !result.conversation_state) {
+          setErrorMsg(result.error || 'Failed to start the interview process. Please try restarting.');
+          speak(result.error || 'Sorry, something went wrong starting our chat. Please try restarting.');
+          addMessage({ sender: 'doctor', text: result.error || 'Something went wrong starting.', timestamp: new Date() });
+          resetState();
+        } else {
+          setConversationState(result.conversation_state);
+          setAudioSrc(result.audio_response || '');
+
+          if (result.status === 'completed') {
+            setGuidelines(result.guidelines || '');
+            setSummary(result.summary || '');
+            setStep('final');
+            addMessage({ sender: 'doctor', text: result.summary || 'Care plan generated.', timestamp: new Date() });
+          } else if (result.conversation_state.current_question) {
+            setStep('interviewing');
+          } else {
+            console.error('Interview started "in_progress" but no current_question received.');
+            setErrorMsg('Something went wrong during interview setup.');
+            speak('Sorry, there was an issue setting up the questions.');
+            addMessage({ sender: 'doctor', text: 'There was an issue setting up questions.', timestamp: new Date() });
+            resetState();
+          }
         }
         setLoading(false);
-      })();
+        isProcessingRef.current = false;
+      };
+      performStartInterview();
     }
-  }, [step, transcript, isManuallyPaused]);
+  }, [step, transcript, isManuallyPaused, resetState]);
 
-  /** Ask static follow-up questions */
   useEffect(() => {
-    if (step === 'followup' && staticFollowUpQuestions.length > 0 && !isAskingStaticRef.current && !isManuallyPaused) {
-      isAskingStaticRef.current = true;
-      (async () => {
-        try {
-          const question = staticFollowUpQuestions[currentStaticIndex];
-          const result = await voiceInput(question);
-          const newAnswers = [...staticFollowUpAnswers];
-          newAnswers[currentStaticIndex] = result;
-          setStaticFollowUpAnswers(newAnswers);
-          if (currentStaticIndex + 1 < staticFollowUpQuestions.length) {
-            setCurrentStaticIndex(currentStaticIndex + 1);
-          } else {
-            speak("Thank you for those details. I’ll ask a few more questions for clarity.");
-            addMessage({ sender: 'doctor', text: "Thank you for those details. I’ll ask a few more questions for clarity.", timestamp: new Date() });
-            setStep('dynamicFollowupLoading');
-          }
-        } finally {
-          isAskingStaticRef.current = false;
-        }
-      })();
-    }
-  }, [step, currentStaticIndex, staticFollowUpQuestions, staticFollowUpAnswers, voiceInput, isManuallyPaused]);
+    if (step === 'interviewing' && currentQuestion && !isProcessingRef.current && !isManuallyPaused) {
+      isProcessingRef.current = true;
+      setErrorMsg('');
 
-  /** Ask dynamic follow-up questions */
-  useEffect(() => {
-    if (step === 'dynamicFollowupLoading' && !isLoadingDynamicRef.current && !isManuallyPaused) {
-      isLoadingDynamicRef.current = true;
-      window.speechSynthesis.cancel();
-      speak("One moment while I prepare a few more personalized questions.");
-      addMessage({ sender: 'doctor', text: "One moment while I prepare a few more personalized questions.", timestamp: new Date() });
-      setLoading(true);
-      (async () => {
+      const handleQuestion = async () => {
         try {
-          const staticQA = staticFollowUpQuestions.map((q, i) => ({ question: q, answer: staticFollowUpAnswers[i] }));
-          const questions = await generateFollowupQuestions(transcript, symptomSummary!, staticQA);
-          setDynamicFollowUpQuestions(questions);
-          setDynamicFollowUpAnswers(Array(questions.length).fill(""));
-          setCurrentDynamicIndex(0);
-          setStep('dynamicFollowup');
-        } catch (error) {
-          speak("I’m sorry, we couldn’t generate more questions. Let’s move forward.");
-          addMessage({ sender: 'doctor', text: "I’m sorry, we couldn’t generate more questions. Let’s move forward.", timestamp: new Date() });
-          setStep('final');
-        } finally {
-          setLoading(false);
-          isLoadingDynamicRef.current = false;
-        }
-      })();
-    } else if (step === 'dynamicFollowup' && dynamicFollowUpQuestions.length > 0 && !isAskingDynamicRef.current && !isManuallyPaused) {
-      isAskingDynamicRef.current = true;
-      (async () => {
-        try {
-          const question = dynamicFollowUpQuestions[currentDynamicIndex];
-          const result = await voiceInput(question);
-          const newDynAnswers = [...dynamicFollowUpAnswers];
-          newDynAnswers[currentDynamicIndex] = result;
-          setDynamicFollowUpAnswers(newDynAnswers);
-          if (currentDynamicIndex + 1 < dynamicFollowUpQuestions.length) {
-            setCurrentDynamicIndex(currentDynamicIndex + 1);
-          } else {
-            speak("Thank you for all your answers. I’m now creating your care plan.");
-            addMessage({ sender: 'doctor', text: "Thank you for all your answers. I’m now creating your care plan.", timestamp: new Date() });
-            setStep('final');
-          }
-        } finally {
-          isAskingDynamicRef.current = false;
-        }
-      })();
-    }
-  }, [step, dynamicFollowUpQuestions, currentDynamicIndex, transcript, symptomSummary, staticFollowUpQuestions, staticFollowUpAnswers, voiceInput, isManuallyPaused]);
+          const answer = await askAndListen(currentQuestion);
 
-  /** Generate final guidelines and auto-play audio */
-  useEffect(() => {
-    if (step === 'final' && !loading && !isManuallyPaused) {
-      setLoading(true);
-      const staticQA = staticFollowUpQuestions.map((q, i) => ({ question: q, answer: staticFollowUpAnswers[i] }));
-      const dynamicQA = dynamicFollowUpQuestions.map((q, i) => ({ question: q, answer: dynamicFollowUpAnswers[i] }));
-      fetch(`${API_BASE_URL}/generate_guidelines`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          transcript,
-          symptom_summary: symptomSummary,
-          follow_up: staticQA,
-          dynamic_followup: dynamicQA
-        })
-      })
-        .then(res => {
-          if (!res.ok) throw new Error("Guideline generation failed");
-          return res.json();
-        })
-        .then(data => {
-          if (data.summary && data.guidelines) {
-            setSummary(data.summary);
-            setGuidelines(data.guidelines);
-            if (data.audio_data) {
-              setAudioSrc(data.audio_data);
-              // Auto-play audio after a short delay
-              setTimeout(() => {
-                if (audioRef.current) {
-                  audioRef.current.play().catch(err => console.error("Auto-play error:", err));
-                }
-              }, 500);
+          if (answer && conversationState) {
+            setStep('submittingAnswer');
+            setLoading(true);
+            setLoadingMessage('Processing your answer...');
+
+            const result = await submitAnswerAndContinue(conversationState, answer);
+
+            if (result.status === 'error' || !result.conversation_state) {
+              setErrorMsg(result.error || 'Failed to process your answer. Please try restarting.');
+              speak(result.error || 'Sorry, something went wrong processing that. Please try restarting.');
+              addMessage({ sender: 'doctor', text: result.error || 'Something went wrong.', timestamp: new Date() });
+              resetState();
+            } else {
+              setConversationState(result.conversation_state);
+              setAudioSrc(result.audio_response || '');
+
+              if (result.status === 'completed') {
+                setGuidelines(result.guidelines || '');
+                setSummary(result.summary || '');
+                setStep('final');
+                addMessage({ sender: 'doctor', text: result.summary || 'Thank you. I’ve completed your care plan.', timestamp: new Date() });
+              } else if (result.conversation_state.current_question) {
+                setStep('interviewing');
+              } else {
+                console.error('Interview step "in_progress" but no next question.');
+                setErrorMsg('Something went wrong fetching the next question.');
+                speak('Sorry, there was an issue getting the next step.');
+                addMessage({ sender: 'doctor', text: 'Issue getting next step.', timestamp: new Date() });
+                resetState();
+              }
             }
           }
-        })
-        .catch(() => {
-          speak("Oh, something went wrong while making your care plan. Please try again later.");
-          addMessage({ sender: 'doctor', text: "Oh, something went wrong while making your care plan. Please try again later.", timestamp: new Date() });
-        })
-        .finally(() => {
+        } catch (error) {
+          console.error('Error during interview question handling:', error);
+          if (!errorMsg) {
+            speak('I encountered an issue. Let’s pause for a moment.');
+            addMessage({ sender: 'doctor', text: 'Encountered an issue.', timestamp: new Date() });
+          }
+        } finally {
           setLoading(false);
-        });
+          isProcessingRef.current = false;
+        }
+      };
+      handleQuestion();
     }
-  }, [step, transcript, symptomSummary, staticFollowUpQuestions, staticFollowUpAnswers, dynamicFollowUpQuestions, dynamicFollowUpAnswers, isManuallyPaused]);
+  }, [step, currentQuestion, conversationState, askAndListen, isManuallyPaused, audioSrc, errorMsg, resetState]);
 
-  /** Restart the application */
-  const handleRestart = () => {
-    setStep('initial');
-    setTranscript('');
-    setSymptomSummary(null);
-    setStaticFollowUpQuestions([]);
-    setStaticFollowUpAnswers([]);
-    setDynamicFollowUpQuestions([]);
-    setDynamicFollowUpAnswers([]);
-    setCurrentStaticIndex(0);
-    setCurrentDynamicIndex(0);
-    setGuidelines('');
-    setSummary('');
-    setAudioSrc('');
-    setConversation([]);
-    setOverlayVisible(true);
-    setWelcomeSpoken(false);
-    setErrorMsg('');
-    setIsManuallyPaused(false);
-    speak("Let’s start fresh. Whenever you’re ready, tap 'Let’s Begin'.");
+  useEffect(() => {
+    if (step === 'final' && audioSrc && audioRef.current) {
+      if (audioRef.current.currentSrc !== audioSrc) {
+        audioRef.current.src = audioSrc;
+        audioRef.current.load();
+      }
+      const playTimeout = setTimeout(() => {
+        if (audioRef.current) {
+          audioRef.current.play().catch((err) => console.error('Audio auto-play failed:', err));
+        }
+      }, 300);
+      return () => clearTimeout(playTimeout);
+    }
+  }, [step, audioSrc]);
+
+  const handleTogglePause = () => {
+    if (isManuallyPaused) {
+      setIsManuallyPaused(false);
+      speak('Okay, let’s continue where we left off.');
+      addMessage({ sender: 'doctor', text: 'Resuming...', timestamp: new Date() });
+    } else {
+      window.speechSynthesis.cancel();
+      cancelListening();
+      setIsManuallyPaused(true);
+      speak('Pausing now. Tap "Resume" or click the screen when you’re ready to continue.');
+      addMessage({ sender: 'doctor', text: 'Paused. Tap "Resume" or screen to continue.', timestamp: new Date() });
+    }
   };
 
   return (
     <div className="flex flex-col w-full min-h-screen font-sans bg-gradient-to-br from-teal-50 via-blue-100 to-indigo-50">
-      <header className="w-full px-6 py-6 shadow-lg bg-gradient-to-r from-teal-600 to-indigo-700">
-        <h1 className="text-4xl font-bold tracking-tight text-center text-white">Your Health, Our Care</h1>
-        <div className="relative w-full h-4 mt-4 overflow-hidden bg-teal-200 rounded-full">
+      <header className="sticky top-0 z-40 w-full px-6 py-4 shadow-md bg-gradient-to-r from-teal-600 to-indigo-700">
+        <h1 className="text-3xl font-bold tracking-tight text-center text-white">Your Health, Our Care</h1>
+        <div className="relative w-full h-3 max-w-3xl mx-auto mt-3 mb-1 overflow-hidden rounded-full bg-teal-200/50">
           <div
-            className="absolute top-0 left-0 h-full transition-all duration-500 ease-in-out bg-gradient-to-r from-teal-400 to-indigo-500"
+            className="absolute top-0 left-0 h-full transition-all duration-500 ease-out rounded-full bg-gradient-to-r from-green-400 to-teal-500"
             style={{ width: progressPercentage }}
           />
-          {["1: Share", "2: Confirm", "3: Questions", "4: More Details", "5: Care Plan"].map((label, idx) => (
-            <div
-              key={idx}
-              className="absolute px-2 py-1 text-sm font-semibold text-white bg-teal-600 rounded-full -top-8 group"
-              style={{ left: `${(idx * 100) / 4}%`, transform: 'translateX(-50%)' }}
-            >
-              {idx + 1}
-              <span className="absolute hidden px-2 py-1 text-xs text-white transform -translate-x-1/2 bg-teal-800 rounded group-hover:block -top-10 left-1/2">
-                {label.split(': ')[1]}
-              </span>
-            </div>
-          ))}
         </div>
-        <h2 className="mt-4 text-2xl font-semibold text-center text-teal-100">{stepIndicator}</h2>
+        <h2 className="text-xl font-semibold text-center text-teal-100">{stepIndicator}</h2>
       </header>
 
-      <main className="flex-grow w-full max-w-5xl px-6 py-10 mx-auto" role="main" aria-live="polite">
+      <main className="flex-grow w-full max-w-5xl px-4 py-8 mx-auto sm:px-6" role="main" aria-live="polite">
         {overlayVisible && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-gradient-to-b from-teal-900/80 to-indigo-900/80 animate-fade-in" onClick={handleOverlayClick}>
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center cursor-pointer bg-gradient-to-b from-teal-900/80 to-indigo-900/80 animate-fade-in"
+            onClick={handleOverlayClick}
+          >
             <div className="p-8 text-center transition-all transform bg-white shadow-2xl rounded-2xl hover:scale-105">
-              <h1 className="mb-4 text-5xl font-bold text-teal-700">Welcome to Your Health Journey</h1>
+              <h1 className="mb-4 text-4xl font-bold text-teal-700">Welcome!</h1>
               <p className="max-w-md mx-auto text-lg text-gray-600">
-                We’re here to listen and support you. Tap anywhere to begin sharing how you’re feeling.
+                Ready to begin? Tap anywhere or click "Let’s Begin" below.
               </p>
             </div>
           </div>
         )}
 
         {errorMsg && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-60">
-            <div className="w-full max-w-md p-8 text-center transition-all transform bg-white shadow-xl rounded-2xl animate-slide-up">
-              <h2 className="mb-4 text-2xl font-semibold text-red-600">Sorry About That</h2>
-              <p className="mb-6 text-gray-700">{errorMsg}</p>
-              <Button onClick={() => setErrorMsg('')} className="px-6 py-3 text-white bg-red-500 rounded-lg hover:bg-red-600" aria-label="Try again">
-                Let’s Try Again
+          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black bg-opacity-60 p-4">
+            <div className="w-full max-w-md p-6 text-center bg-white shadow-xl rounded-2xl animate-slide-up">
+              <h2 className="mb-3 text-xl font-semibold text-red-600">An Issue Occurred</h2>
+              <p className="mb-5 text-gray-700">{errorMsg}</p>
+              <Button
+                onClick={() => {
+                  setErrorMsg('');
+                  resetState();
+                }}
+                className="px-5 py-2 text-white bg-red-500 rounded-lg hover:bg-red-600"
+                aria-label="Restart after error"
+              >
+                Restart Process
               </Button>
             </div>
           </div>
         )}
 
-        {step === 'initial' && (
-          <div className="flex flex-col items-center justify-center w-full space-y-8 animate-fade-in">
-            <div className="relative flex items-center justify-center w-32 h-32 transition-transform transform bg-teal-100 rounded-full shadow-lg hover:scale-110">
-              <Mic className="w-16 h-16 text-teal-600 animate-pulse" />
-              <div className="absolute inset-0 border-4 border-teal-300 rounded-full animate-spin-slow" />
+        {step === 'initial' && !overlayVisible && (
+          <div className="flex flex-col items-center justify-center w-full pt-10 space-y-6 text-center animate-fade-in">
+            <div className="relative flex items-center justify-center transition-transform transform bg-teal-100 rounded-full shadow-lg w-28 h-28 hover:scale-110">
+              <Mic className="text-teal-600 w-14 h-14" />
             </div>
-            <h1 className="text-4xl font-bold text-center text-teal-800">We’re Here for You</h1>
-            <p className="max-w-lg text-lg leading-relaxed text-center text-gray-600">
-              Tell us how you’re doing, and we’ll create a personalized care plan for you.
+            <h1 className="text-3xl font-bold text-teal-800">Let’s Talk About How You’re Feeling</h1>
+            <p className="max-w-lg text-base leading-relaxed text-gray-600">
+              Click the button below and tell us what’s been bothering you. Speak naturally, we’re here to listen.
             </p>
             <Button
               onClick={handleStartRecording}
-              className="inline-flex items-center justify-center px-8 py-4 text-white transition-transform bg-teal-600 rounded-full shadow-lg hover:bg-teal-700 hover:scale-105"
+              disabled={isProcessingRef.current || isManuallyPaused}
+              className="inline-flex items-center justify-center px-6 py-3 text-lg text-white transition-transform bg-teal-600 rounded-full shadow-lg hover:bg-teal-700 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
               aria-label="Start sharing how you feel"
             >
-              <Mic className="w-6 h-6 mr-2" />
+              <Mic className="w-5 h-5 mr-2" />
               Let’s Begin
             </Button>
-            {!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition) && (
-              <div className="w-full max-w-md">
-                <textarea
-                  value={transcript}
-                  onChange={(e) => setTranscript(e.target.value)}
-                  placeholder="Type how you’re feeling here..."
-                  className="w-full p-2 border rounded-lg"
-                  aria-label="Type your symptoms"
-                />
-                <Button
-                  onClick={() => {
-                    setStep('review');
-                    addMessage({ sender: 'patient', text: transcript, timestamp: new Date() });
-                  }}
-                  className="px-4 py-2 mt-2 text-white bg-teal-600 rounded-lg"
-                  aria-label="Submit typed symptoms"
-                >
-                  Submit
-                </Button>
-              </div>
-            )}
           </div>
         )}
 
-        {(step === 'recording' || step === 'review') && loading && (
-          <div className="flex flex-col items-center justify-center space-y-4 animate-fade-in">
-            <Loader2 className="w-12 h-12 text-teal-600 animate-spin" />
-            <p className="text-lg text-gray-700">I’m listening carefully to what you’re saying...</p>
+        {loading && (step === 'startingInterview' || step === 'submittingAnswer' || (step === 'final' && !guidelines)) && (
+          <div className="fixed inset-0 z-[55] flex flex-col items-center justify-center text-center bg-gradient-to-b from-teal-900/70 to-indigo-900/70 p-4">
+            <Loader2 className="w-12 h-12 mb-4 text-teal-300 animate-spin" />
+            <p className="text-lg font-semibold text-white">{loadingMessage || 'Processing...'}</p>
           </div>
         )}
 
-        {step === 'final' && !loading && guidelines && (
-          <div className="w-full p-8 bg-white shadow-xl rounded-2xl animate-slide-up">
-            <h2 className="mb-6 text-3xl font-bold text-center text-teal-700">Your Personalized Care Plan</h2>
+        {step === 'final' && !loading && (guidelines || summary) && (
+          <div className="w-full p-6 bg-white shadow-xl sm:p-8 rounded-2xl animate-slide-up">
+            <h2 className="mb-5 text-3xl font-bold text-center text-teal-700">Your Personalized Care Plan</h2>
             {summary && (
-              <div className="mb-6">
-                <h3 className="text-2xl font-semibold text-teal-600">Summary</h3>
-                <p className="text-lg leading-relaxed text-gray-700">{summary}</p>
+              <div className="p-4 mb-6 border-l-4 border-teal-500 rounded-r-lg bg-teal-50">
+                <h3 className="mb-2 text-xl font-semibold text-teal-600">Quick Summary</h3>
+                <p className="text-base leading-relaxed text-gray-700">{summary}</p>
                 {audioSrc && (
-                  <audio ref={audioRef} controls autoPlay className="w-full mt-4">
-                    <source src={audioSrc} type="audio/mp3" />
-                    Your browser does not support the audio element.
-                  </audio>
+                  <div className="mt-4">
+                    <audio ref={audioRef} controls className="w-full h-10">
+                      <source src={audioSrc} type="audio/mp3" />
+                      Your browser does not support the audio element.
+                    </audio>
+                  </div>
                 )}
               </div>
             )}
-            <div>
-              <h3 className="text-2xl font-semibold text-teal-600">Detailed Guidelines</h3>
-              <p className="text-lg leading-relaxed text-gray-700">{guidelines}</p>
+            {guidelines && (
+              <div className="mt-4">
+                <h3 className="mb-2 text-xl font-semibold text-teal-600">Detailed Guidelines</h3>
+                <div className="space-y-2 text-base leading-relaxed text-gray-700 whitespace-pre-wrap">{guidelines}</div>
+              </div>
+            )}
+            <div className="mt-8 text-center">
+              <Button onClick={handleRestart} className="px-6 py-2 text-white bg-teal-600 rounded-lg hover:bg-teal-700">
+                Start Over
+              </Button>
             </div>
           </div>
         )}
 
-        {step !== 'initial' && (
-          <div className="grid w-full grid-cols-1 gap-8 mt-10 lg:grid-cols-2">
-            <div className="bg-white p-6 rounded-2xl shadow-lg h-[28rem] overflow-auto transition-all hover:shadow-xl">
-              <h2 className="mb-4 text-2xl font-semibold text-teal-700">Our Conversation</h2>
-              <div className="space-y-4">
+        {step !== 'initial' && step !== 'final' && !overlayVisible && (
+          <div className="mt-6 text-center">
+            <p className="text-gray-600">
+              {step === 'recording'
+                ? 'Listening for your initial statement...'
+                : step === 'review'
+                ? 'Please confirm the transcript...'
+                : step === 'interviewing' && currentQuestion
+                ? `Waiting for your answer to: "${currentQuestion}"`
+                : 'Processing...'}
+            </p>
+          </div>
+        )}
+
+        {step !== 'initial' && !overlayVisible && (
+          <div className="grid w-full grid-cols-1 gap-6 mt-8 lg:grid-cols-5">
+            <div className="lg:col-span-3 bg-white p-4 sm:p-6 rounded-2xl shadow-lg h-[30rem] flex flex-col overflow-hidden transition-all hover:shadow-xl">
+              <h2 className="flex-shrink-0 mb-4 text-xl font-semibold text-teal-700">Conversation Log</h2>
+              <div className="flex-grow pr-2 space-y-3 overflow-y-auto">
                 {conversation.map((msg, idx) => (
-                  <div key={idx} className={`flex items-start ${msg.sender === 'doctor' ? 'justify-start' : 'justify-end'} animate-slide-in`}>
-                    {msg.sender === 'doctor' ? (
-                      <User className="flex-shrink-0 w-6 h-6 mr-3 text-teal-600" />
-                    ) : (
-                      <Mic className="flex-shrink-0 w-6 h-6 mr-3 text-indigo-600" />
-                    )}
-                    <div className={`px-4 py-3 rounded-xl max-w-xs shadow-md ${msg.sender === 'doctor' ? 'bg-teal-50 text-gray-800' : 'bg-indigo-50 text-gray-800'}`}>
-                      <p className="text-sm leading-relaxed">{msg.text}</p>
-                      <p className="mt-1 text-xs text-gray-500">{msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                  <div
+                    key={idx}
+                    className={`flex items-end text-sm ${msg.sender === 'doctor' ? 'justify-start' : 'justify-end'} animate-slide-in`}
+                  >
+                    {msg.sender === 'doctor' && <User className="flex-shrink-0 w-5 h-5 mr-2 text-teal-600" />}
+                    <div
+                      className={`px-3 py-2 rounded-xl max-w-[80%] shadow-sm ${
+                        msg.sender === 'doctor' ? 'bg-teal-50 text-gray-800 rounded-bl-none' : 'bg-indigo-50 text-gray-800 rounded-br-none'
+                      }`}
+                    >
+                      <p className="leading-snug">{msg.text}</p>
                     </div>
+                    {msg.sender === 'patient' && <User className="flex-shrink-0 w-5 h-5 ml-2 text-indigo-600" />}
                   </div>
                 ))}
+                {loading && step === 'submittingAnswer' && (
+                  <div className="flex items-center justify-center p-2">
+                    <Loader2 className="w-5 h-5 text-teal-600 animate-spin" />
+                    <p className="ml-2 text-sm text-gray-500">Processing answer...</p>
+                  </div>
+                )}
                 <div ref={conversationEndRef} />
               </div>
             </div>
 
-            {(staticFollowUpQuestions.length > 0 || dynamicFollowUpQuestions.length > 0) && (
-              <div className="bg-white p-6 rounded-2xl shadow-lg h-[28rem] overflow-auto transition-all hover:shadow-xl">
-                <h2 className="mb-4 text-2xl font-semibold text-teal-700">What You’ve Shared</h2>
-                {staticFollowUpQuestions.length > 0 && (
-                  <div className="mb-6">
-                    <h3 className="mb-2 text-lg font-medium text-gray-700">Initial Questions</h3>
-                    <ul className="space-y-3">
-                      {staticFollowUpQuestions.map((q, i) => (
-                        <li key={`static-${i}`} className="p-3 rounded-lg bg-teal-50">
-                          <span className="block font-medium text-teal-800">{q}</span>
-                          {staticFollowUpAnswers[i] && (
-                            <p className="mt-1 text-gray-600">You mentioned: {staticFollowUpAnswers[i]}</p>
-                          )}
-                        </li>
-                      ))}
+            <div className="lg:col-span-2 bg-white p-4 sm:p-6 rounded-2xl shadow-lg h-[30rem] overflow-auto transition-all hover:shadow-xl">
+              <h2 className="mb-4 text-xl font-semibold text-teal-700">Current Summary</h2>
+              {conversationState?.symptom_summary ? (
+                <div className="space-y-2 text-sm">
+                  <p>
+                    <strong className="font-medium text-teal-700">Main Symptom:</strong>{' '}
+                    {conversationState.symptom_summary.key_symptom || 'Not identified'}
+                  </p>
+                  <p>
+                    <strong className="font-medium text-teal-700">Severity:</strong>{' '}
+                    {conversationState.symptom_summary.severity || 'Not specified'}
+                  </p>
+                  <p>
+                    <strong className="font-medium text-teal-700">Onset/Duration:</strong>{' '}
+                    {conversationState.symptom_summary.onset_duration || 'Not specified'}
+                  </p>
+                  <p>
+                    <strong className="font-medium text-teal-700">Location:</strong>{' '}
+                    {conversationState.symptom_summary.location || 'Not specified'}
+                  </p>
+                  <p>
+                    <strong className="font-medium text-teal-700">Character:</strong>{' '}
+                    {conversationState.symptom_summary.character || 'Not specified'}
+                  </p>
+                  <p>
+                    <strong className="font-medium text-teal-700">Other Symptoms:</strong>{' '}
+                    {conversationState.symptom_summary.associated_symptoms || 'None mentioned'}
+                  </p>
+                </div>
+              ) : (
+                <p className="text-gray-500">Summary will appear here after your initial statement.</p>
+              )}
+              {conversationState?.static_followup &&
+                conversationState.static_followup.some((item) => item.answer) && (
+                  <div className="pt-4 mt-4 border-t">
+                    <h3 className="mb-2 text-base font-semibold text-teal-700">Standard Questions Answered</h3>
+                    <ul className="space-y-1 text-sm">
+                      {conversationState.static_followup
+                        .filter((item) => item.answer)
+                        .map((item, idx) => (
+                          <li key={`static-ans-${idx}`}>
+                            <strong>Q:</strong> {item.question} <br />
+                            <strong>A:</strong> {item.answer}
+                          </li>
+                        ))}
                     </ul>
                   </div>
                 )}
-                {dynamicFollowUpQuestions.length > 0 && (
-                  <div>
-                    <h3 className="mb-2 text-lg font-medium text-gray-700">Additional Details</h3>
-                    <ul className="space-y-3">
-                      {dynamicFollowUpQuestions.map((q, i) => (
-                        <li key={`dynamic-${i}`} className="p-3 rounded-lg bg-indigo-50">
-                          <span className="block font-medium text-indigo-800">{q}</span>
-                          {dynamicFollowUpAnswers[i] && (
-                            <p className="mt-1 text-gray-600">You mentioned: {dynamicFollowUpAnswers[i]}</p>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            )}
+            </div>
           </div>
         )}
 
-        {micActive && currentPrompt && (
-          <div className="fixed max-w-md p-4 text-center text-gray-800 transform -translate-x-1/2 bg-teal-100 rounded-lg shadow-lg top-20 left-1/2 animate-fade-in">
-            <p>{currentPrompt}</p>
+        {micActiveUI && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black bg-opacity-40 pointer-events-none">
+            <div className="flex items-center justify-center w-32 h-32 bg-teal-100 rounded-full shadow-2xl animate-pulse">
+              <Mic className="w-16 h-16 text-teal-600" />
+            </div>
+          </div>
+        )}
+
+        {isManuallyPaused && (
+          <div
+            className="fixed inset-0 z-[80] flex flex-col items-center justify-center text-center cursor-pointer bg-gradient-to-b from-gray-900/80 to-black/80 animate-fade-in p-4"
+            onClick={handleTogglePause}
+          >
+            <Activity className="w-16 h-16 mb-4 text-teal-300 animate-pulse" />
+            <h1 className="mb-2 text-3xl font-bold text-white">Paused</h1>
+            <p className="text-lg text-teal-100">Tap anywhere or click "Resume" to continue.</p>
           </div>
         )}
       </main>
 
-      <footer className="w-full py-6 text-center text-teal-100 bg-teal-700">
-        <p className="text-sm">Your health is our priority. This isn’t a replacement for professional medical advice.</p>
+      <footer className="w-full py-4 text-center text-gray-600 bg-teal-100/50">
+        <p className="text-xs">
+          This tool provides information but is not a substitute for professional medical advice. Always consult a doctor for diagnosis and treatment.
+        </p>
       </footer>
 
-      {micActive && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40">
-          <div className="flex items-center justify-center w-40 h-40 bg-teal-100 rounded-full shadow-2xl animate-pulse">
-            <Mic className="w-20 h-20 text-teal-600" />
-          </div>
-        </div>
-      )}
+      {step !== 'initial' && !overlayVisible && (
+        <>
+          <Button
+            onClick={handleTogglePause}
+            className={`fixed z-[90] px-4 py-2 text-white transition-colors rounded-full shadow-lg bottom-4 left-4 ${
+              isManuallyPaused ? 'bg-green-500 hover:bg-green-600' : 'bg-yellow-500 hover:bg-yellow-600'
+            }`}
+            aria-label={isManuallyPaused ? 'Resume the process' : 'Pause the process'}
+            disabled={loading || step === 'final'}
+          >
+            {isManuallyPaused ? 'Resume' : 'Pause'}
+          </Button>
 
-      {isManuallyPaused && (
-        <div
-          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-gradient-to-b from-teal-900/80 to-indigo-900/80 animate-fade-in"
-          onClick={() => {
-            setIsManuallyPaused(false);
-            speak("Let’s continue where we left off.");
-          }}
-        >
-          <h1 className="mb-4 text-4xl font-bold text-white">Paused</h1>
-          <p className="text-lg text-teal-100">Tap anywhere to resume when you’re ready.</p>
-        </div>
-      )}
-
-      {loading && (step === 'followupLoading' || step === 'dynamicFollowupLoading' || step === 'final') && (
-        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-gradient-to-b from-teal-900/70 to-indigo-900/70">
-          <Loader2 className="w-16 h-16 text-teal-300 animate-spin" />
-          <p className="mt-6 text-xl font-semibold text-white">{getLoadingMessage()}</p>
-        </div>
-      )}
-
-      {step !== 'initial' && (
-        <Button
-          onClick={() => {
-            if (isManuallyPaused) {
-              setIsManuallyPaused(false);
-              speak("Let’s continue where we left off.");
-            } else {
-              setIsManuallyPaused(true);
-              speak("Pausing now. Tap 'Resume' whenever you’re ready.");
-            }
-          }}
-          className="fixed px-4 py-2 text-white transition-colors bg-teal-600 rounded-full shadow-lg bottom-4 left-4 hover:bg-teal-700"
-          aria-label={isManuallyPaused ? "Resume the process" : "Pause the process"}
-        >
-          {isManuallyPaused ? 'Resume' : 'Pause'}
-        </Button>
-      )}
-
-      {step !== 'initial' && (
-        <Button
-          onClick={handleRestart}
-          className="fixed px-4 py-2 text-white transition-colors bg-teal-600 rounded-full shadow-lg bottom-4 right-4 hover:bg-teal-700"
-          aria-label="Restart the health journey"
-        >
-          Restart
-        </Button>
+          <Button
+            onClick={handleRestart}
+            className="fixed z-[90] px-4 py-2 text-white transition-colors bg-red-500 rounded-full shadow-lg bottom-4 right-4 hover:bg-red-600"
+            aria-label="Restart the health journey"
+            disabled={loading}
+          >
+            Restart
+          </Button>
+        </>
       )}
     </div>
   );
